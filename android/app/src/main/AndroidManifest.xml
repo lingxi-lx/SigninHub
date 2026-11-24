@@ -113,18 +113,11 @@
             android:label="多账号管理"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
-        <!-- 手机侧兜底执行器：无障碍模拟点击（按包名过滤 WorkBuddy / Trae Solo 事件） -->
-        <service
-            android:name=".AutoClickService"
-            android:exported="false"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
-        </service>
+        <!-- H2（BUGS-v2.61）：无障碍服务 AutoClickService 已整体删除。
+             原配置 canRetrieveWindowContent=true + flagRetrieveInteractiveWindows
+             且没有 android:packageNames，等于声明「可读全机所有应用的窗口内容」，
+             而 TARGET_PACKAGES 里的 com.workbuddy.app / com.trae.solo 是从未验证的
+             占位包名（docs/REVIEW.md P3-14），前端也从未调用过它 —— 纯风险零功能。 -->
 
         <!-- 定时提醒（每天固定时间本地通知） -->
         <receiver

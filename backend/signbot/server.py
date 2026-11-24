@@ -3,8 +3,10 @@
 运行：python -m signbot.server    （在 backend/ 目录下）
 """
 import json
+import hmac
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -22,7 +24,7 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web")
 
 # 与 android/app/build.gradle.kts 的 versionName 保持一致：改版本时两处一起改。
 # 前端设置页「高级」里会显示这个号，用来确认装的/连的是哪一版。
-APP_VERSION = "2.61"
+APP_VERSION = "2.62"
 
 # 视为「仅本机可访问」的监听地址（启动横幅据此决定是否打安全提示）
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "")
@@ -46,6 +48,131 @@ def _crypto_brief():
         return (len(lost) == 0), lost
     except Exception:
         return True, []
+
+
+# ---------------------------------------------------------------------------
+# 口令爆破限速（BUGS-v2.61 的 M7）
+#
+# 原来 `_check_auth` 是纯比较，没有任何失败计数 —— 局域网里跑个 hydra 就能
+# 离线爆破 api_token（默认还是空串）。这里按来源 IP 记失败次数：
+#   - 60 秒窗口内失败 5 次 → 锁 60 秒；再犯翻倍（60/120/240…上限 30 分钟）；
+#   - 成功一次立即清零，避免正常用户手抖输错被长期拖住。
+# 状态只在内存里（重启清零）—— 这是有意的：落盘反而给了攻击者一个
+# 「重启服务就重置计数器」以外的另一种玩法（改文件）。
+# ---------------------------------------------------------------------------
+_AUTH_FAIL_WINDOW = 60.0
+_AUTH_FAIL_LIMIT = 5
+_AUTH_LOCK_MAX = 1800.0
+_auth_state = {}          # {ip: [fail_times(list), lock_until(float), strikes(int)]}
+_auth_lock = threading.Lock()
+
+
+def _throttled(ip: str) -> bool:
+    """该来源是否仍在锁定窗口内。"""
+    now = time.time()
+    with _auth_lock:
+        st = _auth_state.get(ip)
+        if not st:
+            return False
+        return st["lock_until"] > now
+
+
+def _note_attempt(ip: str, ok: bool) -> None:
+    """记一次口令尝试结果。"""
+    now = time.time()
+    with _auth_lock:
+        st = _auth_state.setdefault(ip, {"fails": [], "lock_until": 0.0, "strikes": 0})
+        if ok:
+            st["fails"] = []
+            st["lock_until"] = 0.0
+            st["strikes"] = 0
+            return
+        st["fails"] = [t for t in st["fails"] if now - t < _AUTH_FAIL_WINDOW]
+        st["fails"].append(now)
+        if len(st["fails"]) >= _AUTH_FAIL_LIMIT:
+            st["strikes"] += 1
+            wait = min(_AUTH_FAIL_WINDOW * (2 ** (st["strikes"] - 1)), _AUTH_LOCK_MAX)
+            st["lock_until"] = now + wait
+            st["fails"] = []
+        # 表太大时清掉过期项，防止被随机源地址刷爆内存
+        if len(_auth_state) > 4096:
+            for k in [k for k, v in _auth_state.items() if v["lock_until"] < now and not v["fails"]]:
+                _auth_state.pop(k, None)
+
+
+# 安全响应头（BUGS-v2.61 的 M6）。
+# 后端原来的响应只有 Server/Date/Content-Type/Content-Length —— 没有 CSP，
+# 于是任何一处 XSS（哪怕是用户自己填的 webhook 名回显）都能直接执行脚本，
+# 而脚本能读 localStorage 里的 api_token 再打到局域网其它设备。
+# 页面里没有内联 <script>、没有 <style> 标签、没有 onclick=（实测），
+# 所以 script-src 可以收到 'self'；style 属性有 17 处，style-src 必须留 'unsafe-inline'。
+SECURITY_HEADERS = (
+    ("Content-Security-Policy",
+     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+     "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; "
+     "frame-ancestors 'none'; frame-src 'none'; base-uri 'none'; form-action 'self'; "
+     "object-src 'none'"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+    ("Permissions-Policy", "geolocation=(), microphone=(), camera=()"),
+)
+
+
+# ---------------------------------------------------------------------------
+# 打上游的只读接口：最小间隔 + 结果缓存（BUGS-v2.61 的 M8 / N1）
+#
+# `/api/wb_assets?refresh=1`、`/api/growth`、`/api/growth/daily`、`/api/heat`
+# 这几个 GET 都会**带着用户的 accessToken 打上游**：wb_assets 会去查资源包、
+# growth 会去查成长值、heat 会去查热力图，doctor 还会对配置里的代理地址做
+# 3 秒 TCP 探测。原来它们挂在「空口令即放行」的只读分支上，同网段任何人
+# 循环 GET 就能：① 把用户的额度刷成上游限流；② 拿 doctor 当内网端口扫描器。
+#
+# 两道闸：
+#   1. 同一个 key 在 `_UPSTREAM_MIN_INTERVAL` 内只真正打一次上游，其余请求
+#      直接拿缓存 —— 刷新按钮连点、SW 重放、恶意循环都变成读内存。
+#   2. 每个来源 IP 对打上游接口有每分钟次数上限，超了 429。
+# 缓存只在内存里，进程重启即失效，不会让「刚签完到」的状态长期陈旧。
+# ---------------------------------------------------------------------------
+_UPSTREAM_MIN_INTERVAL = 60.0     # 同一 key 两次真打上游的最小间隔（秒）
+_UPSTREAM_HITS_PER_MIN = 20       # 每个 IP 每分钟最多触发几次上游查询
+_upstream_cache = {}              # {key: (ts, payload)}
+_upstream_hits = {}               # {ip: [timestamps]}
+_upstream_lock = threading.Lock()
+
+
+def _upstream_budget(ip: str) -> bool:
+    """该 IP 这一分钟还有没有触发上游查询的额度。"""
+    now = time.time()
+    with _upstream_lock:
+        hits = [t for t in _upstream_hits.get(ip, []) if now - t < 60.0]
+        if len(hits) >= _UPSTREAM_HITS_PER_MIN:
+            _upstream_hits[ip] = hits
+            return False
+        hits.append(now)
+        _upstream_hits[ip] = hits
+        if len(_upstream_hits) > 4096:
+            for k in [k for k, v in _upstream_hits.items() if not v or now - v[-1] > 60.0]:
+                _upstream_hits.pop(k, None)
+        return True
+
+
+def _cached_upstream(key: str, fn, ttl: float = _UPSTREAM_MIN_INTERVAL):
+    """
+    带最小间隔的上游查询。`ttl` 内重复调用直接返回上次结果。
+
+    `fn()` 抛异常时**不写缓存** —— 否则一次网络抖动会让接口在接下来一分钟里
+    一直返回同一个错误。
+    """
+    now = time.time()
+    with _upstream_lock:
+        hit = _upstream_cache.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    with _upstream_lock:
+        _upstream_cache[key] = (now, val)
+    return val
 
 
 # provider key → 它的直连配置块名（proxy 等连接参数都在这里）
@@ -220,7 +347,22 @@ def _notify_brief(cfg):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = f"SigninHub/{APP_VERSION}"
+    # L3（BUGS-v2.61）：原来 server_version 拼了 APP_VERSION，每个响应都回
+    # `Server: SigninHub/2.61 Python/3.12.8` —— 等于主动告诉扫描器「这是
+    # SigninHub，版本 2.61」，配套的漏洞清单可以照着打。版本号只在 /api/ping
+    # 里给前端用，HTTP 头里不需要。
+    server_version = "SigninHub"
+    sys_version = ""
+
+    def version_string(self) -> str:
+        # 基类实现是 `server_version + " " + sys_version`，sys_version 置空后会
+        # 留下一个尾随空格（`Server: SigninHub `）。这里直接返回纯名字。
+        return self.server_version
+
+    # L5（BUGS-v2.61）：默认 protocol_version 是 HTTP/1.0，每个请求都要重新
+    # 建 TCP 连接（前端首屏要拉 index + css + js + 10 张 logo，等于 13 次握手）。
+    # 所有响应都带 Content-Length（含 send_error），可以安全开 keep-alive。
+    protocol_version = "HTTP/1.1"
 
     # ---------- helpers ----------
     #
@@ -391,16 +533,23 @@ class Handler(BaseHTTPRequestHandler):
             host = host.rsplit(":", 1)[0]
         return self._private_host(host)
 
-    def _send_json(self, obj, code=200):
+    def _security_headers(self):
+        """M6：每个响应都带上安全头（见模块级 SECURITY_HEADERS 的说明）。"""
+        for k, v in SECURITY_HEADERS:
+            self.send_header(k, v)
+
+    def _send_json(self, obj, code=200, *, head_only=None):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self._cors_headers()
+        self._security_headers()
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if not (self._head_only if head_only is None else head_only):
+            self.wfile.write(data)
 
-    def _send_file(self, path, ctype):
+    def _send_file(self, path, ctype, *, head_only=None):
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -409,11 +558,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        self._security_headers()
         self.send_header("Content-Length", str(len(data)))
         # 静态资源一律走缓存校验：每次回源确认，避免改了 app.js/css 前端还拿旧缓存
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        self.wfile.write(data)
+        if not (self._head_only if head_only is None else head_only):
+            self.wfile.write(data)
 
     def _is_loopback(self) -> bool:
         client = (self.client_address[0] if self.client_address else "") or ""
@@ -421,14 +572,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _redact_logs(self, logs):
         """
-        非本机来源把 `detail` 裁掉（BUGS-v2.25 的 P2-2）。
+        把 `detail` 裁掉（BUGS-v2.25 的 P2-2，BUGS-v2.61 的 L11）。
 
-        手机 App 必须能通过局域网读 /api/logs，所以只读接口不能一刀切禁掉；
-        但 `detail` 里是账号指纹（`{"source":"vault:cn","account":"6f4620daaef19822"}`），
-        同网段任何人扫一眼就能对应出是谁的账号。本机控制台保留原样。
+        `detail` 里是账号指纹（`{"source":"vault:cn","account":"6f4620daaef19822"}`）。
+        原来只在「非本机来源」时裁，本机保留原样 —— 但本机来源不等于可信：
+        任意浏览器页面（哪怕不是控制台）发起的请求源 IP 就是 127.0.0.1。
+        审计里 L11 的建议就是去掉这个短路，本机也裁。
         """
-        if self._is_loopback():
-            return logs
         out = []
         for row in (logs or []):
             if isinstance(row, dict):
@@ -441,28 +591,49 @@ class Handler(BaseHTTPRequestHandler):
         return out
 
     def _check_auth(self) -> bool:
+        """
+        口令校验（BUGS-v2.61 的 H4 / M7）。
+
+        ## H4：空口令不再是「只读全放行」
+
+        原来没设口令时，`GET/HEAD/OPTIONS` 一律 `return True` —— 默认监听
+        0.0.0.0 + 默认空口令，等于同网段任何人 `curl http://<ip>:8787/api/status`
+        就能拿到全部账号状态、`/api/logs` 拿到签到明细、`/api/config` 拿到配置
+        （含掩码凭据与代理地址），而且 `/api/wb_assets?refresh=1` 会**真的带着
+        用户的 accessToken 打上游**，`/api/growth` 会真的去领成长值。
+
+        现在空口令时：
+          - 只读接口仅对**本机来源**放行（手机 App 想连就必须先设口令 ——
+            启动横幅与设置页都写了这一点，这是有意的取舍：局域网裸奔的代价
+            比「多填一个口令」大得多）；
+          - 写操作仍然要「本机来源 + 本机控制台 Origin」。
+
+        ## M7：恒定时间比较 + 失败限速 + 不再支持 ?token=
+
+        - `hmac.compare_digest` 替代 `==`：`==` 在首个不同字节就返回，攻击者能按
+          响应时间一位一位试出口令。
+        - 失败计数按来源 IP 记，5 次/分钟以上指数退避，超限直接 429，
+          并且不再往下走业务逻辑 —— 原来可以无限次尝试。
+        - 去掉 `?token=` 回退：URL 会进浏览器历史、Referer、代理日志、Shell
+          history，一个能被日志记下来的口令等于泄露。只认 `X-API-Token` 头。
+        """
         cfg = load_config()
         token = (cfg["server"].get("api_token") or "").strip()
+        client = (self.client_address[0] if self.client_address else "") or ""
+
         if not token:
-            # 没设口令时（P0-2 / P2-2）：
-            #   只读 → 保持原样放行（手机 App 要能通过局域网读 /api/status、
-            #          /api/logs 才能用；这里收紧会直接废掉主功能）。
-            #          真正敏感的字段改为「按来源裁掉」，见 _redact_logs()。
-            #   写操作 → 必须「本机来源 + 本机控制台 Origin」两个条件同时成立。
-            #          原来只判「源 IP 是本机」，而浏览器本机请求的源 IP 就是
-            #          127.0.0.1 —— 任意网页一句 fetch POST /api/config 就能把
-            #          proxy 改成攻击者的代理，之后签到请求（含 Authorization:
-            #          Bearer）全部过中间人。加 Origin 校验后这条路被堵死，
-            #          同时本机控制台（Origin: http://127.0.0.1:8787）照常可用，
-            #          curl / 脚本（不带 Origin）也照常可用。
+            # 空口令：只读接口仅本机可用；写操作要本机 + 本机控制台来源
             if self.command in ("GET", "HEAD", "OPTIONS"):
-                return True
+                return self._is_loopback()
             return self._is_loopback() and self._csrf_ok()
-        given = self.headers.get("X-API-Token", "")
-        if not given:
-            q = parse_qs(urlparse(self.path).query)
-            given = (q.get("token") or [""])[0]
-        return given == token
+
+        if _throttled(client):
+            return False
+
+        given = self.headers.get("X-API-Token", "") or ""
+        ok = bool(given) and hmac.compare_digest(given, token)
+        _note_attempt(client, ok)
+        return ok
 
     def _csrf_ok(self) -> bool:
         """
@@ -503,9 +674,27 @@ class Handler(BaseHTTPRequestHandler):
         pass  # 静默，避免刷屏
 
     # ---------- routing ----------
+    # L4（BUGS-v2.61）：原来没有 do_HEAD，BaseHTTPRequestHandler 对未实现的
+    # 方法直接回 501 —— 而 HEAD 是监控探活 / 缓存校验的常用方法，501 会让
+    # 外部工具把它当成「服务不可用」。这里复用 GET 的路由，只丢掉 body。
+    _head_only = False
+
+    def do_HEAD(self):
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            self._head_only = False
+
     def do_OPTIONS(self):
-        # 预检不再无条件放行：只有白名单 Origin 才会拿到 Allow-* 头
-        self._send_json({}, 204)
+        # 预检不再无条件放行：只有白名单 Origin 才会拿到 Allow-* 头。
+        # 204 不能带 Content-Length（HTTP/1.1 下带 body 长度会让 keep-alive 错位），
+        # 所以这里手写响应头，不走 _send_json。
+        self.send_response(204)
+        self._cors_headers()
+        self._security_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         if not self._host_ok():
@@ -546,8 +735,22 @@ class Handler(BaseHTTPRequestHandler):
             )
             return self._send_file(full, ctype)
 
-        # API
+        # 空口令 + 非本机：直接说清楚为什么被拒，别让用户对着 401 猜
         if not self._check_auth():
+            cfg_srv = load_config()["server"]
+            if not (cfg_srv.get("api_token") or "").strip():
+                # 没配口令：只可能是「非本机在读」或「写操作来源不合法」
+                if self._is_loopback():
+                    return self._send_json({"error": "forbidden origin"}, 403)
+                return self._send_json(
+                    {"error": "unauthorized",
+                     "hint": "后端未设置访问口令，只读接口仅本机可用。"
+                             "请在电脑端「设置 - 访问口令」里设一个口令，手机端填同一个。"}, 401)
+            client = (self.client_address[0] if self.client_address else "") or ""
+            if _throttled(client):
+                return self._send_json(
+                    {"error": "too many failed attempts",
+                     "hint": "口令错误次数过多，请等一会儿再试。"}, 429)
             return self._send_json({"error": "unauthorized"}, 401)
 
         cfg = load_config()
@@ -662,29 +865,41 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(_masked_config(cfg))
 
         if path == "/api/doctor":
-            providers = build_providers(cfg)
-            out = []
-            for key, p in providers.items():
-                if (cfg["providers"].get(key) or {}).get("retired"):
-                    continue  # 已下线的 provider 不参与体检
-                rd = readiness(key, cfg["providers"][key], str(DATA_DIR))
-                # P1-2 加固（BUGS-v2.40）：代理填了但不可达时，签到只会报
-                # 「网络错误: [WinError 10061]」，用户根本想不到是代理的问题。
-                # 这里对每个非空 proxy 做一次 3 秒 TCP 探测，把原因说清楚。
-                pr = _proxy_check_cached(key, cfg["providers"][key])
-                issues = list(rd["issues"])
-                if pr:
-                    issues.append(pr)
-                out.append({
-                    "key": key, "label": p.label,
-                    "enabled": cfg["providers"][key].get("enabled", True),
-                    # ready 只表示「凭据齐不齐」——代理不通是连接问题，不是凭据问题，
-                    # 混进 ready 会让卡片在代理抖动时反复变灰。代理问题放 issues + proxy_ok。
-                    "mode": rd["mode"], "ready": rd["ready"], "issues": issues,
-                    "proxy": _proxy_of(key, cfg["providers"][key]),
-                    "proxy_ok": (pr == ""),
-                })
-            return self._send_json({"providers": out})
+            # N1（BUGS-v2.61）：这个接口会对配置里的每个 proxy 做 3 秒 TCP 探测 ——
+            # 未授权可触发时就是一个现成的内网端口扫描器。除了 _check_auth 收紧，
+            # 这里再加一层：结果缓存 60 秒 + 每 IP 每分钟次数上限。
+            ip = (self.client_address[0] if self.client_address else "") or ""
+            if not _upstream_budget(ip):
+                return self._send_json(
+                    {"error": "请求过于频繁，请稍后再试（每分钟上限 %d 次）"
+                              % _UPSTREAM_HITS_PER_MIN}, 429)
+
+            def _doctor():
+                providers = build_providers(cfg)
+                out = []
+                for key, p in providers.items():
+                    if (cfg["providers"].get(key) or {}).get("retired"):
+                        continue  # 已下线的 provider 不参与体检
+                    rd = readiness(key, cfg["providers"][key], str(DATA_DIR))
+                    # P1-2 加固（BUGS-v2.40）：代理填了但不可达时，签到只会报
+                    # 「网络错误: [WinError 10061]」，用户根本想不到是代理的问题。
+                    # 这里对每个非空 proxy 做一次 3 秒 TCP 探测，把原因说清楚。
+                    pr = _proxy_check_cached(key, cfg["providers"][key])
+                    issues = list(rd["issues"])
+                    if pr:
+                        issues.append(pr)
+                    out.append({
+                        "key": key, "label": p.label,
+                        "enabled": cfg["providers"][key].get("enabled", True),
+                        # ready 只表示「凭据齐不齐」——代理不通是连接问题，不是凭据问题，
+                        # 混进 ready 会让卡片在代理抖动时反复变灰。代理问题放 issues + proxy_ok。
+                        "mode": rd["mode"], "ready": rd["ready"], "issues": issues,
+                        "proxy": _proxy_of(key, cfg["providers"][key]),
+                        "proxy_ok": (pr == ""),
+                    })
+                return {"providers": out}
+
+            return self._send_json(_cached_upstream("doctor", _doctor))
 
         if path == "/api/notify_logs":
             try:
@@ -785,11 +1000,21 @@ class Handler(BaseHTTPRequestHandler):
                                     "month": month, "totals": db.stats()})
 
         # ── 新增：积分资产 / 成长中心 ──────────────────────────────────
+        # M8（BUGS-v2.61）：以下四个 GET 都会带用户的 accessToken 真打上游，
+        # 必须限频 + 缓存，不能当成普通只读接口。
         if path == "/api/wb_assets":
             from . import wb_assets
+            ip = (self.client_address[0] if self.client_address else "") or ""
             force = (q.get("refresh") or [""])[0] in ("1", "true")
             wb_cfg = (cfg.get("providers", {}).get("workbuddy", {}) or {}).get("wb") or {}
-            return self._send_json(wb_assets.card(wb_cfg, use_cache=not force))
+            if not force:
+                return self._send_json(wb_assets.card(wb_cfg, use_cache=True))
+            if not _upstream_budget(ip):
+                return self._send_json(
+                    {"ok": False, "error": "刷新过于频繁，请稍后再试（每分钟上限 %d 次）"
+                                            % _UPSTREAM_HITS_PER_MIN}, 429)
+            return self._send_json(_cached_upstream(
+                "wb_assets", lambda: wb_assets.card(wb_cfg, use_cache=False)))
 
         if path == "/api/wb_accounts":
             # 成长中心的「账号切换」：电脑端只有一份 wb 凭据（config.json 里那一个），
@@ -805,20 +1030,36 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/growth":
             from . import wb_growth
+            ip = (self.client_address[0] if self.client_address else "") or ""
             wb_cfg = (cfg.get("providers", {}).get("workbuddy", {}) or {}).get("wb") or {}
-            return self._send_json(wb_growth.overview(wb_cfg))
+            if not _upstream_budget(ip):
+                return self._send_json(
+                    {"ok": False, "error": "请求过于频繁，请稍后再试（每分钟上限 %d 次）"
+                                            % _UPSTREAM_HITS_PER_MIN}, 429)
+            return self._send_json(_cached_upstream(
+                "growth", lambda: wb_growth.overview(wb_cfg)))
 
         if path == "/api/growth/daily":
             from . import wb_growth
             from . import workbuddy as wbm
+            ip = (self.client_address[0] if self.client_address else "") or ""
             wb_cfg = (cfg.get("providers", {}).get("workbuddy", {}) or {}).get("wb") or {}
+            if not _upstream_budget(ip):
+                return self._send_json(
+                    {"ok": False, "error": "请求过于频繁，请稍后再试（每分钟上限 %d 次）"
+                                            % _UPSTREAM_HITS_PER_MIN,
+                     "rows": []}, 429)
             cred, _problems = wbm.resolve_credential(wb_cfg)
             if cred is None:
                 return self._send_json({"ok": False, "error": "未配置 WorkBuddy 凭据", "rows": []})
-            try:
-                return self._send_json({"ok": True, "detail": wb_growth.get_streak(cred)})
-            except Exception as e:
-                return self._send_json({"ok": False, "error": str(e), "rows": []})
+
+            def _daily():
+                try:
+                    return {"ok": True, "detail": wb_growth.get_streak(cred)}
+                except Exception as e:
+                    return {"ok": False, "error": str(e), "rows": []}
+
+            return self._send_json(_cached_upstream("growth_daily", _daily))
 
         if path == "/api/auto_status":
             # 这个接口只在安卓端由 LocalApi 实现（读 WorkManager 排期 + 上次运行记录）。
@@ -873,19 +1114,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/heat":
             from . import wb_growth
             from . import workbuddy as wbm
+            ip = (self.client_address[0] if self.client_address else "") or ""
             wb_cfg = (cfg.get("providers", {}).get("workbuddy", {}) or {}).get("wb") or {}
+            if not _upstream_budget(ip):
+                return self._send_json(
+                    {"ok": False, "error": "请求过于频繁，请稍后再试（每分钟上限 %d 次）"
+                                            % _UPSTREAM_HITS_PER_MIN}, 429)
             cred, _problems = wbm.resolve_credential(wb_cfg)
             if cred is None:
                 return self._send_json({"ok": False, "error": "未配置 WorkBuddy 凭据"})
-            try:
-                d = wb_growth.get_heatmap(cred)
-                cells = []
-                for c in (d.get("cells") or []):
-                    if isinstance(c, dict) and c.get("date"):
-                        cells.append({"date": c.get("date"), "score": int(c.get("score") or 0)})
-                return self._send_json({"ok": True, "cells": cells, "today": d.get("today") or {}})
-            except Exception as e:
-                return self._send_json({"ok": False, "error": str(e)})
+
+            def _heat():
+                try:
+                    d = wb_growth.get_heatmap(cred)
+                    cells = []
+                    for c in (d.get("cells") or []):
+                        if isinstance(c, dict) and c.get("date"):
+                            cells.append({"date": c.get("date"), "score": int(c.get("score") or 0)})
+                    return {"ok": True, "cells": cells, "today": d.get("today") or {}}
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
+
+            return self._send_json(_cached_upstream("heat", _heat))
 
         if path == "/api/refresh_totals":
             # P1-2（BUGS-v1.63）：这个接口会并发打四家上游并写库，属于副作用操作。
@@ -1296,12 +1546,43 @@ def _lan_ip() -> str:
     return "127.0.0.1"
 
 
+def _ensure_api_token() -> tuple:
+    """
+    空口令自动补一个随机口令（BUGS-v2.61 的 H4）。
+
+    默认监听 0.0.0.0 + 默认空口令 = 同网段任何人只读全开（`/api/status` 能看到
+    所有账号、`/api/wb_assets?refresh=1` 会真的带用户 accessToken 打上游）。
+    但「默认只绑 127.0.0.1」会把主功能打死 —— 这个后端的核心用途就是给手机 App
+    连。所以改成：首次启动自动生成 24 字节随机口令写进 config.json，并在启动
+    横幅里打印一次，用户照抄进手机 App 即可。
+
+    返回 `(token, generated)`。生成失败（磁盘不可写）时返回空串，此时只读接口
+    退回「仅本机可用」，不会静默放开。
+    """
+    from .config import update_config
+    cfg = load_config()
+    token = (cfg["server"].get("api_token") or "").strip()
+    if token:
+        return token, False
+    new = secrets.token_urlsafe(24)
+
+    def _set(cur):
+        cur.setdefault("server", {})["api_token"] = new
+
+    try:
+        update_config(_set)
+    except Exception:
+        return "", False
+    return new, True
+
+
 def serve(host: str = None, port: int = None):
     import sys
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
+    token, token_generated = _ensure_api_token()
     cfg = load_config()
     host = host or cfg["server"].get("host", "0.0.0.0")
     port = port or cfg["server"].get("port", 8787)
@@ -1321,12 +1602,18 @@ def serve(host: str = None, port: int = None):
     print(f"  本机控制台:   http://127.0.0.1:{port}/")
     print(f"  手机访问(局域网): http://{lan}:{port}/   <- 手机 App 填这个")
     print(f"  数据目录:     {DATA_DIR}")
-    api_token = (cfg["server"].get("api_token") or "").strip()
-    if not api_token and host not in _LOOPBACK_HOSTS:
+    if token_generated:
+        print("  " + "-" * 46)
+        print("  已自动生成访问口令（首次启动，只打印这一次）：")
+        print(f"      {token}")
+        print("  手机端「设置 - 后端地址」里填上面这个口令。")
+        print("  也可以在电脑端「设置 - 访问口令」里改成自己好记的。")
+        print("  " + "-" * 46)
+    elif not token:
         print("  " + "!" * 46)
-        print("  [安全提示] 当前监听 " + str(host) + " 且未设置 API 口令：")
-        print("  同网段设备可只读访问控制台；写操作（改配置/触发签到）已被拒绝。")
-        print("  如需手机端操作，请在「设置 - 访问口令」里设置一个口令。")
+        print("  [安全提示] 未设置 API 口令且无法自动生成（数据目录不可写）：")
+        print("  只读接口已限制为仅本机可用，手机端将无法连接。")
+        print("  请手动在 backend/data/config.json 的 server.api_token 里填一个口令。")
         print("  " + "!" * 46)
     print("  按 Ctrl+C 停止服务")
     print("=" * 50)

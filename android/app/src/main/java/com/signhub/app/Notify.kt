@@ -94,8 +94,15 @@ object Notify {
             .putString("kind", c.kind)
             .putString("url", c.url)
         // 解不开且用户没重填 → 保留原密文，绝不写空串覆盖（N6，BUGS-v2.1）
+        // M3（BUGS-v2.61）：加密失败时也不写 —— 宁可这次不落盘，也不能把
+        // webhook secret 明文写进 SharedPreferences。
         if (!(c.secretLost && c.secret.isEmpty())) {
-            e.putString("secret", SecretBox.encrypt(c.secret))
+            if (c.secret.isEmpty()) {
+                e.putString("secret", "")
+            } else {
+                val enc = SecretBox.encryptOrNull(c.secret)
+                if (enc != null) e.putString("secret", enc)
+            }
         }
         e.apply()
     }

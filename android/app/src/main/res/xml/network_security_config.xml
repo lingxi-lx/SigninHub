@@ -10,9 +10,15 @@
 
   所以这里采取「默认允许 + 对已知上游域名强制 HTTPS」：
   - base-config 保留 cleartextTrafficPermitted="true"，局域网后端照旧能用；
-  - 四家上游（WorkBuddy / Trae / Qoder / MiniMax）逐个声明 cleartextTrafficPermitted="false"，
-    即使 config.json 里的地址被改成 http://api.trae.cn 之类的降级地址，系统层也会直接拒绝，
-    避免凭据在明文通道里裸奔。
+  - 四家上游（WorkBuddy / Trae / Qoder / MiniMax / 华为码道）逐个声明
+    cleartextTrafficPermitted="false"，即使 config.json 里的地址被改成
+    http://api.trae.cn 之类的降级地址，系统层也会直接拒绝，避免凭据在明文通道里裸奔。
+
+  L8（BUGS-v2.61）：原来漏了华为码道两个域名（devcloud.cn-north-4.huaweicloud.com、
+  codearts.huaweicloud.com），它们的 cookie（devclouddevuibjtcftk CSRF 令牌 +
+  J_SESSION_ID 会话）可以走明文。已补 huaweicloud.com 整域。
+  另外后端侧还有一层：provider.py 的自定义接口 URL 必须过 netguard.check_url，
+  公网地址一律强制 https（见 backend/signbot/netguard.py）。
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="true">
@@ -32,6 +38,8 @@
         <domain includeSubdomains="true">qoder.sh</domain>
         <domain includeSubdomains="true">minimax.cn</domain>
         <domain includeSubdomains="true">minimaxi.com</domain>
+        <!-- L8：华为码道（devcloud 签到接口 + codearts 页面） -->
+        <domain includeSubdomains="true">huaweicloud.com</domain>
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>

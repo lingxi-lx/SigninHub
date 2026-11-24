@@ -310,7 +310,12 @@ class LoginWebActivity : Activity() {
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
-            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            // M2（BUGS-v2.61）：原来是 MIXED_CONTENT_COMPATIBILITY_MODE —— 允许
+            // https 页面里加载 http 子资源。登录页全是 https，唯一会被它放行的是
+            // 「中间人把某个子资源（脚本/iframe）降到 http」这种降级攻击，而降级的
+            // 目的往往就是往页面里注入 JS，进而调 SignHubLogin 桥伪造凭据。
+            // 改成 NEVER_ALLOW：http 子资源一律不加载，页面可能少几个图标，但桥安全。
+            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             // 阿里云 SSO 会从 account.aliyun.com 弹新窗口做登录，不放开会白屏
             javaScriptCanOpenWindowsAutomatically = true
             setSupportMultipleWindows(true)
@@ -319,11 +324,15 @@ class LoginWebActivity : Activity() {
                     "Chrome/120.0.0.0 Mobile Safari/537.36"
         }
 
-        // Qoder / WorkBuddy 的登录都要跨域回跳（account.aliyun.com、openapi.qoder.com.cn），
-        // Android 5.0+ 默认禁第三方 Cookie，不显式放开 SSO 回调一定拿不到会话。
+        // M2（BUGS-v2.61）：第三方 Cookie 只对「确实要跨站回跳」的两家开。
+        // 原来自始至终 true —— 登录页里任何第三方 iframe（广告、统计、被注入的
+        // 资源）都能在这个 WebView 里种/读 Cookie，配合 JS 桥就是一个跨站取数通道。
+        // 现在只有 WorkBuddy（走 account.aliyun.com / codebuddy SSO）与 Qoder
+        // （openapi.qoder.com.cn 回跳）需要它，其余三家关掉。
+        val needsThirdPartyCookie = provider == P_WB || provider == P_WB_AI || provider == P_QD
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
-            setAcceptThirdPartyCookies(web, true)
+            setAcceptThirdPartyCookies(web, needsThirdPartyCookie)
         }
 
         web.addJavascriptInterface(object {

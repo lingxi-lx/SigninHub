@@ -14,6 +14,8 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 
+from . import netguard
+
 PLACEHOLDER_RE = re.compile(r"^[A-Z0-9_]{4,}$")
 
 
@@ -184,13 +186,14 @@ class BaseProvider:
         http_status = None
         raw = ""
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                http_status = r.status
-                raw = r.read(8000).decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            http_status = e.code
-            raw = e.read(4000).decode("utf-8", "replace")
-            return self._classify(http_status, raw, h, day, failed=True)
+            # 出站目标校验：url 来自用户填的自定义 provider，必须过 netguard
+            http_status, raw = netguard.open_checked(req, timeout=20)
+        except netguard.BlockedTarget as e:
+            return {
+                "status": "fail", "http_status": None,
+                "message": f"接口地址被拒绝: {e}", "points": "",
+                "detail": "", "dry_run": False,
+            }
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             return {
                 "status": "fail", "http_status": None,

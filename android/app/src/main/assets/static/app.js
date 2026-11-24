@@ -82,7 +82,23 @@
     if (!BASE) return location.origin;
     return BASE.replace(/\/+$/, "");
   }
-  let TOKEN = localStorage.getItem("signhub_token") || "";
+  /* M1（BUGS-v2.61）：口令不再写 localStorage。
+     localStorage 是「同源、永久、任何脚本都能读」的存储 —— 后端一旦被 XSS 或
+     局域网内被仿站页面劫持，令牌会跟着浏览器一直留在盘上（关掉浏览器也不消失，
+     共享电脑上更是直接泄露）。改成 sessionStorage：只活在当前标签页，关掉即失效。
+     旧版本存在 localStorage 里的值读一次后立刻删除，完成迁移。 */
+  let TOKEN = "";
+  try {
+    TOKEN = (sessionStorage.getItem("signhub_token") || "").trim();
+    if (!TOKEN) {
+      const legacy = (localStorage.getItem("signhub_token") || "").trim();
+      if (legacy) {
+        TOKEN = legacy;
+        sessionStorage.setItem("signhub_token", legacy);
+      }
+    }
+    localStorage.removeItem("signhub_token");
+  } catch (_) { TOKEN = ""; }
 
   async function api(path, opts = {}) {
     const headers = Object.assign({}, opts.headers);
@@ -2457,7 +2473,7 @@
     try {
       await api("/api/config", { method: "POST", body: JSON.stringify({ server: { api_token: v } }) });
       TOKEN = v;
-      localStorage.setItem("signhub_token", TOKEN);
+      try { sessionStorage.setItem("signhub_token", TOKEN); } catch (_) {}
       $("#apiToken").value = v;
       $("#newToken").value = "";
       toast("口令已设置");
@@ -2468,6 +2484,7 @@
     try {
       await api("/api/config", { method: "POST", body: JSON.stringify({ server: { api_token: "" } }) });
       TOKEN = "";
+      try { sessionStorage.removeItem("signhub_token"); } catch (_) {}
       localStorage.removeItem("signhub_token");
       $("#apiToken").value = "";
       toast("口令已清除");
@@ -2481,7 +2498,11 @@
     if (BASE) localStorage.setItem("signhub_base", BASE);
     else localStorage.removeItem("signhub_base");
     TOKEN = $("#apiToken").value.trim();
-    if (TOKEN) localStorage.setItem("signhub_token", TOKEN); else localStorage.removeItem("signhub_token");
+    try {
+      if (TOKEN) sessionStorage.setItem("signhub_token", TOKEN);
+      else sessionStorage.removeItem("signhub_token");
+    } catch (_) {}
+    localStorage.removeItem("signhub_token");
     toast("已保存，正在连接…");
     await loadAll();
   });

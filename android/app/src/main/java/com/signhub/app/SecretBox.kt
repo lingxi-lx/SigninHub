@@ -26,8 +26,11 @@ import javax.crypto.spec.GCMParameterSpec
  *   - **解密失败返回 [DECRYPT_FAILED] 哨兵，而不是空串**。空串会被上层当成
  *     「用户清空了凭据」，下一次任意一次设置保存就把完好的密文覆盖成 ""，
  *     从此再也解不回来（BUGS-v1.63 P1-1）。哨兵让上层能区分「真的空」与「解不开」。
- *   - 加密失败仍然退回明文（不能因此让用户完全存不了凭据），但会累加 [failures]，
- *     由 /api/status 透出 `crypto_ok=false`，设置页可以提示「本机凭据未加密」。
+ *   - **加密失败不再退回明文（M3，BUGS-v2.61）**。原实现 `catch { return plain }` 会在
+ *     Keystore 异常时把 accessToken / refreshToken / cookie **明文写进
+ *     SharedPreferences / DataStore** —— 那正是本文件存在的理由被绕过，而且用户
+ *     完全无感（只有一个黄条）。现在抛 [CryptoUnavailable]，调用方据此**放弃写盘**
+ *     （保留上一次的密文），前端红条提示「本机凭据未加密，请重启 App」。
  */
 internal object SecretBox {
     private const val TAG = "SecretBox"
@@ -36,6 +39,14 @@ internal object SecretBox {
     private const val TRANSFORM = "AES/GCM/NoPadding"
     private const val GCM_TAG_BITS = 128
     private const val IV_BYTES = 12
+
+    /**
+     * 本机密钥不可用（Keystore 初始化失败 / 密钥被系统清掉 / 硬件不支持）。
+     *
+     * 抛这个而不是退回明文：明文落盘比「这次存不进去」严重得多 —— 存不进去
+     * 用户重试一次就好，明文落盘则是永久泄露。
+     */
+    class CryptoUnavailable(message: String, cause: Throwable? = null) : Exception(message, cause)
 
     /**
      * 解密失败的哨兵值。
@@ -55,10 +66,31 @@ internal object SecretBox {
      * 每次 /api/status 都要解 8 个字段，而 /api/status 每 25 秒跑一次；
      * 密文在进程内是稳定不变的，缓存掉可以省掉 8 次 AES-GCM 运算。
      * 上限 32 条（凭据字段总共不到 20 个），accessOrder=true 做 LRU。
+     *
+     * L2（BUGS-v2.61）：加了 5 分钟 TTL。原来只有 LRU 上限、没有过期 ——
+     * 明文 token 会一直驻留在进程堆里（内存 dump / 崩溃日志 / 同进程其它
+     * 组件的反射都能捞到），而凭据本身的有效期以天计，等于明文在内存里
+     * 活得和进程一样久。过期后下次访问重新解一次，代价可以忽略。
      */
-    private val plainCache = object : LinkedHashMap<String, String>(32, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
-            size > 32
+    private val plainCache = object : LinkedHashMap<String, Pair<String, Long>>(32, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, Pair<String, Long>>?
+        ): Boolean = size > 32
+    }
+
+    private const val CACHE_TTL_MS = 5 * 60 * 1000L
+
+    private fun cacheGet(key: String): String? {
+        val hit = synchronized(plainCache) { plainCache[key] } ?: return null
+        if (System.currentTimeMillis() - hit.second > CACHE_TTL_MS) {
+            synchronized(plainCache) { plainCache.remove(key) }
+            return null
+        }
+        return hit.first
+    }
+
+    private fun cachePut(key: String, plain: String) {
+        synchronized(plainCache) { plainCache[key] = plain to System.currentTimeMillis() }
     }
 
     /** 加密失败次数：>0 说明 Keystore 不可用，凭据可能以明文落盘（P2-1）。 */
@@ -83,6 +115,16 @@ internal object SecretBox {
     /** 密文前缀；用于判断一个值是否已经加密过。 */
     fun isEncrypted(v: String): Boolean = v.startsWith(PREFIX)
 
+    /**
+     * 加密。
+     *
+     * M3（BUGS-v2.61）：失败时**抛 [CryptoUnavailable]，绝不返回明文**。
+     * 原来 catch 里 `return plain` 等于「加密挂了就把长期凭据明文写进
+     * SharedPreferences / DataStore」，而这一切只留一个 Log.e + 一个黄条 ——
+     * 用户根本不知道自己的 accessToken 已经裸奔。
+     * 调用方（[encryptKeep] / [SettingsStore.save] / [Notify]）都按「存不进去」
+     * 处理：跳过这次写盘，保留上一次的密文，由 UI 提示重启 App。
+     */
     fun encrypt(plain: String): String {
         if (plain.isEmpty()) return ""
         // 已经是密文就别重复加密（重复套娃会导致解密一次仍是密文）
@@ -95,23 +137,30 @@ internal object SecretBox {
             val out = PREFIX + Base64.encodeToString(iv + ct, Base64.NO_WRAP)
             // N7（BUGS-v2.1）：encrypt 之后要把结果塞进解密缓存。
             // 否则 save() 完立刻 flow() 读回来时缓存未命中，白跑一次 AES-GCM + Keystore。
-            synchronized(plainCache) { plainCache[out] = plain }
+            cachePut(out, plain)
             // P2R2（BUGS-v2.2）：成功一次就说明 Keystore 已恢复，把历史失败计数清掉。
             // 否则偶发一次失败会让 healthy() 永远返回 false，前端黄条永不消失。
             if (encFailures != 0) encFailures = 0
             out
         } catch (e: Exception) {
             encFailures++
-            Log.e(TAG, "加密失败，退回明文存储（第 $encFailures 次）", e)
-            plain
+            Log.e(TAG, "加密失败，本次不落盘（第 $encFailures 次）", e)
+            throw CryptoUnavailable("本机密钥不可用，请重启 App 后重试", e)
         }
+    }
+
+    /** [encrypt] 的安全版：失败返回 null，让调用方跳过写盘而不是写明文。 */
+    fun encryptOrNull(plain: String): String? = try {
+        encrypt(plain)
+    } catch (e: CryptoUnavailable) {
+        null
     }
 
     fun decrypt(stored: String): String {
         if (stored.isEmpty()) return ""
         // 老数据是明文：原样返回，等下次 save 时再加密
         if (!isEncrypted(stored)) return stored
-        synchronized(plainCache) { plainCache[stored]?.let { return it } }
+        cacheGet(stored)?.let { return it }
         return try {
             val raw = Base64.decode(stored.removePrefix(PREFIX), Base64.NO_WRAP)
             if (raw.size <= IV_BYTES) return DECRYPT_FAILED
@@ -120,7 +169,7 @@ internal object SecretBox {
             val cipher = Cipher.getInstance(TRANSFORM)
             cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(GCM_TAG_BITS, iv))
             val out = String(cipher.doFinal(ct), Charsets.UTF_8)
-            synchronized(plainCache) { plainCache[stored] = out }
+            cachePut(stored, out)
             out
         } catch (e: Exception) {
             // 密钥被清（换机 / 清数据 / 用户删了锁屏）或密文损坏。
@@ -131,8 +180,7 @@ internal object SecretBox {
             Log.e(TAG, "解密失败，返回哨兵值（保留密文，等用户重填）", e)
             cachedKey = null        // 密钥可能已失效，下次强制重建
             synchronized(plainCache) { plainCache.clear() }
-            DECRYPT_FAILED
-        }
+            DECRYPT_FAILED        }
     }
 
     /**
@@ -173,7 +221,8 @@ internal object SecretBox {
         // 也不会把 "\u0000DECRYPT_FAILED" 加密后覆盖掉原密文（N1）。
         if (isFailed(plain)) return rawIfLost
         if (plain.isEmpty() && rawIfLost.isNotEmpty() && isEncrypted(rawIfLost)) return rawIfLost
-        return encrypt(plain)
+        // M3：加密失败时沿用原密文（可能为空），绝不返回明文。
+        return encryptOrNull(plain) ?: rawIfLost
     }
 
     /**

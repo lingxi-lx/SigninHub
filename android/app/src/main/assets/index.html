@@ -11,7 +11,7 @@
 <link rel="apple-touch-icon" href="/static/icon-180.png" />
 <link rel="icon" href="/static/icon-192.png" />
 <title>签到中心</title>
-<link rel="stylesheet" href="/static/app.css?v=261" />
+<link rel="stylesheet" href="/static/app.css?v=262" />
 </head>
 <body>
   <div class="reveal-mask" id="revealMask"><span></span></div>
@@ -311,8 +311,9 @@
             <input id="serverUrl" placeholder="http://192.168.1.100:8787" />
           </label>
           <p class="muted small">手机与电脑需同一网络。留空表示使用当前页面地址。</p>
-          <label class="field" style="margin-top:10px">API Token<input id="apiToken" type="password" placeholder="后端未设置口令可留空" /></label>
+          <label class="field" style="margin-top:10px">API Token<input id="apiToken" type="password" placeholder="电脑端启动时会打印一个口令" /></label>
           <button class="save-btn" id="saveConn">保存并连接</button>
+          <p class="muted small">口令只保存在当前标签页（关掉浏览器即失效），不写入本地长期存储。</p>
         </section>
 
         <section class="panel">
@@ -554,6 +555,6 @@
   </div>
   <div id="petFloatBtn" hidden></div>
   <canvas id="confettiCv"></canvas>
-  <script src="/static/app.js?v=261"></script>
+  <script src="/static/app.js?v=262"></script>
 </body>
 </html>

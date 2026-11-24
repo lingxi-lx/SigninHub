@@ -518,6 +518,18 @@ App 里「登录 Trae 账号」现在会同时抓 session 与 token；设置页�
 
 ---
 
+## 从源码构建安卓 App（正式签名包）
+
+日常调试直接 `gradlew assembleDebug` 出 debug 包即可（无需任何签名配置）。要出**正式签名包**（assembleRelease），需自备签名身份：
+
+1. `android/keystore.properties` 与 `android/keystore/*.jks` **不在仓库里**（.gitignore 已排除，那是作者的发布身份）。模板见 `android/keystore.properties.example`：
+   复制一份、填入你自己生成的 keystore（`keytool -genkeypair -v -keystore android/keystore/my-release.jks -alias myalias -keyalg RSA -keysize 4096 -validity 10950`），改名 `keystore.properties` 放到 `android/` 根目录。
+2. 有 `keystore.properties` 时，`gradlew assembleRelease` 自动挂上你的签名并开 R8 混淆；没有时 release 变体仍是未签名包，装不上。
+3. R8 保留规则在 `android/app/proguard-rules.pro`：WebView JS 桥（`@JavascriptInterface`）、WorkManager Worker、广播接收器等反射入口已硬编码保留。给代码新增 JS 桥方法或 Worker 时记得补 keep 规则，否则 release 包运行时会 `undefined is not a function` 或 Worker 不跑（debug 包完全正常这是最常见的「只有 release 崩」类 issue 来源）。
+4. **普通用户请直接从 Releases 页下载 APK，不要自己 assembleDebug**debug 包用公开的调试证书签名（debuggable），任何应用都能同签名覆盖安装，且部分 ROM 会拦截。
+
+---
+
 ## 四、安卓 App（控制台 + 提醒 + 无障碍兜底）
 
 `android/` 是标准 Gradle 工程，用 **Android Studio** 打开即可编译安装（首次会自动下载依赖）。命令行：

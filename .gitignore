@@ -1,4 +1,4 @@
-﻿# ===== 运行数据与密钥（绝不上传） =====
+# ===== 运行数据与密钥（绝不上传） =====
 backend/data/
 backend/*.log
 backend/server.out.log
@@ -23,3 +23,8 @@ __pycache__/
 *.apk
 !release/*.apk
 *.zip
+# ---- 签名与发布身份（绝对不能入库） ----
+android/keystore/
+android/keystore.properties
+*.jks
+*.keystore

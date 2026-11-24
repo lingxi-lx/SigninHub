@@ -1,0 +1,24 @@
+# SigninHub 后端依赖（可选）
+
+**这个项目默认零第三方依赖** —— `backend/signbot/` 全部用 Python 标准库实现，
+`python run.py` 直接就能跑。这个文件只列**可选**依赖，用于开启额外能力。
+
+## 装什么
+
+```bash
+# 仅当要用「浏览器模式」登录（Playwright 抓 token）时才需要
+pip install "playwright>=1.40,<2.0"
+playwright install chromium
+```
+
+## 为什么放在这里
+
+`README.md` 里提到「浏览器模式需要 playwright」，但仓库里没有 requirements.txt，
+`pip install -r requirements.txt` 会直接报 `No such file or directory`。
+
+## 别装什么
+
+- **不要**装 `cryptography` / `pycryptodome`：`vault.py` 的跨平台加密用
+  HMAC-SHA256 作 PRF 的 CTR + HMAC 认证，标准库就够，装了只会让人以为有硬依赖。
+- **不要**装 `requests` / `flask` / `fastapi`：后端是 `http.server` 标准库实现，
+  引入框架等于重写。

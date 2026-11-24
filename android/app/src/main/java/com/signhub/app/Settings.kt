@@ -147,6 +147,7 @@ object SettingsStore {
      * 或用户重新登录时再自然更新。
      */
     suspend fun save(context: Context, s: AppSettings) {
+        var cryptoFailed = false
         context.dataStore.edit { p ->
             p[KEY_URL] = s.serverUrl
             p[KEY_REMINDER_ON] = s.reminderEnabled
@@ -165,9 +166,15 @@ object SettingsStore {
             p[KEY_MM_DEVICE] = s.mmDeviceId
 
             // 凭据字段：credsLost 时空值视为「读不出来」而不是「用户清空」，跳过不覆盖。
+            // M3（BUGS-v2.61）：加密失败（Keystore 不可用）时也不写 —— encryptOrNull
+            // 返回 null 就跳过这个 key，保留上一次的密文，由 UI 提示重启 App。
+            // 原来 encrypt() 会退回明文，等于把 token 裸写进 DataStore。
             fun putCred(key: androidx.datastore.preferences.core.Preferences.Key<String>, v: String) {
                 if (v.isEmpty() && s.credsLost) return
-                p[key] = SecretBox.encrypt(v)
+                if (v.isEmpty()) { p[key] = ""; return }
+                val enc = SecretBox.encryptOrNull(v)
+                if (enc == null) { cryptoFailed = true; return }
+                p[key] = enc
             }
             putCred(KEY_TOKEN, s.token)
             putCred(KEY_WB_TOKEN, s.wbToken)
@@ -179,6 +186,13 @@ object SettingsStore {
             putCred(KEY_MM_TOKEN, s.mmToken)
             putCred(KEY_HW_COOKIE, s.hwCookie)
             putCred(KEY_HW_PORTAL, s.hwPortalCookie)
+        }
+        if (cryptoFailed) {
+            // M3：明确告知「这次没存进去」，而不是静默把明文写下去。
+            android.util.Log.e(
+                "SettingsStore",
+                "凭据加密失败，本次保存跳过密文字段（保留旧密文），请提示用户重启 App"
+            )
         }
     }
 }

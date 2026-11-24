@@ -2,6 +2,7 @@ package com.signhub.app
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.CertificatePinner
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -253,6 +254,82 @@ object LocalCheckin {
         "MiniMaxAgent Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) MiniMax/3.1.16 Chrome/148.0.7778.280 Safari/537.36"
 
+    /**
+     * M4（BUGS-v2.61）：证书固定。原来全仓 0 处 CertificatePinner，而
+     * `clientFor(proxy)` 允许用户填任意 HTTP 代理（`provider.*.proxy`）——
+     * 一个被改过的代理就能用自签证书 MITM 掉所有签到请求，把
+     * `Cloud-IDE-JWT` / `drt-` / `token` 全部拿走。
+     *
+     * 只对**已知上游域名**固定；其它 host（含用户自填的自定义 provider、
+     * webhook）不受影响，不会误伤。每个域名同时 pin 叶子证书和中间 CA，
+     * OkHttp 只要有一条匹配就放行 —— 叶子到期换发时中间 CA 那条仍然有效。
+     *
+     * 维护：上游换 CA（不是换叶子）时这里必须更新，否则对应 provider 会
+     * 报 `SSLPeerUnverifiedException`。取值脚本见 docs/PINS.md。
+     */
+    private val PINNER: CertificatePinner = CertificatePinner.Builder()
+        // Trae（api/work/www.trae.cn 同一张 *.trae.cn 证书）
+        .add(
+            "**.trae.cn",
+            "sha256/TPHUxm8Mczeiq1ovvtYFvBRjjgFMV2PA+IG8om10L18=",
+            "sha256/IsBGRWLpt/3tNcYciM0PhSfcIZE0JMAm3QrTFcZRCL4=",
+            "sha256/E3tYcwo9CiqATmKtpMLW5V+pzIq+ZoDmpXSiJlXGmTo=",
+            "sha256/SDG5orEv8iX6MNenIAxa8nQFNpROB/6+llsZdXHZNqs="
+        )
+        // Trae 国际版
+        .add(
+            "**.trae.ai",
+            "sha256/c+av7z7Px+fweK8UTTbrleY/yaPHF6g3qUK8Hanbe3Q=",
+            "sha256/SDG5orEv8iX6MNenIAxa8nQFNpROB/6+llsZdXHZNqs="
+        )
+        // Qoder CN
+        .add(
+            "**.qoder.com.cn",
+            "sha256/1C2rDiaZqjPg1wnVUB6vrzaiVt2hcjLG+uRItuGggFw=",
+            "sha256/Sc7wL4FfOw8ued5w3JOSzu5MzB471PfqdyN4hnMYbX4=",
+            "sha256/cGuxAXyFXFkWm61cF4HPWX8S0srS9j0aSqN0k4AP+4A="
+        )
+        // Qoder 国际版
+        .add(
+            "**.qoder.sh",
+            "sha256/0NvFGU2W1cU8b3M5TXpZ+NnbiBIneileT/7g9IQp1qA=",
+            "sha256/SDG5orEv8iX6MNenIAxa8nQFNpROB/6+llsZdXHZNqs="
+        )
+        // MiniMax Code
+        .add(
+            "**.minimax.cn",
+            "sha256/jPKgT6AspJvQsQqn/dNll6Bi9UHH75O+VnHXVN5HftQ=",
+            "sha256/3Vk1Rs5ICzrrvS5Tdw6FhJy0d53xmGah2+kDRvgHkPU=",
+            "sha256/i7WTqTvh0OioIruIfFR4kMPnBqrS2rdiVPl/s2uC/CY="
+        )
+        // WorkBuddy / CodeBuddy（腾讯）
+        .add(
+            "**.codebuddy.cn",
+            "sha256/nwczc/O0exRKQ/u++21QOmSMfs9qV7OgIpJRdRUq+aE=",
+            "sha256/731AZkcNdxw9L154ZN3auYetdnXwhN81UrZZTmrgK8M=",
+            "sha256/ape1HIIZ6T5d7GS61YBs3rD4NVvkfnVwELcCRW4Bqv0="
+        )
+        .add(
+            "**.workbuddy.ai",
+            "sha256/PZz+QZ3xleKsVZbvfzHGfmCPYtYyZlnbMmESC0ThUrQ=",
+            "sha256/731AZkcNdxw9L154ZN3auYetdnXwhN81UrZZTmrgK8M=",
+            "sha256/ape1HIIZ6T5d7GS61YBs3rD4NVvkfnVwELcCRW4Bqv0="
+        )
+        .add(
+            "copilot.tencent.com",
+            "sha256/msf4AsD2EfdPpQLf6h3td+B1/1V0xJllDZxa+Gdh4yY=",
+            "sha256/iRVt6vFAG0+gB4h7KFntBfxhDjw2OHuU0tsCfL5BCW8=",
+            "sha256/i7WTqTvh0OioIruIfFR4kMPnBqrS2rdiVPl/s2uC/CY="
+        )
+        // 华为码道（devcloud 与 codearts 同属 huaweicloud，叶子不同、中间 CA 相同）
+        .add(
+            "**.huaweicloud.com",
+            "sha256/+R5dERLFt66s7Bof7N0z2jLMLblOjffkKXeWWHDrTCQ=",
+            "sha256/wOWNjm5D6jCrROkWzSwgdF5PWvff8qG4kh0XKgIVnAY=",
+            "sha256/hETpgVvaLC0bvcGG3t0cuqiHvr4XyP2MTwCiqhgRWwU="
+        )
+        .build()
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -262,6 +339,8 @@ object LocalCheckin {
         // 只能靠 callTimeout 让 OkHttp 自己抛 InterruptedIOException 结束调用、
         // 把线程还给 6 线程的 NET_POOL。35 秒 < 60 秒，保证线程先自己退出。
         .callTimeout(35, TimeUnit.SECONDS)
+        // M4：固定上游证书，代理也换不掉
+        .certificatePinner(PINNER)
         .build()
 
     private val JSON = "application/json; charset=utf-8".toMediaType()

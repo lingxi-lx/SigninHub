@@ -283,6 +283,15 @@ class WebUiActivity : ComponentActivity() {
                 // 所以：只读接口照旧同步处理（快、必要），写接口直接回一条明确的错误，
                 // 让前端提示用户刷新，而不是把整个 WebView 卡死。
                 if (path.startsWith("/api/")) {
+                    // M5（BUGS-v2.61）：这条兜底路径原来只判 method 与 isFastPath，
+                    // 不判「请求是不是主文档发起的」、也不看 Origin。于是页面里任何
+                    // iframe（或已被导航走的第三方页）都能靠 `<img src="/api/status">`
+                    // 这类跨源子资源请求把本机 API 的数据读走 —— 响应体虽然是 JSON，
+                    // 但接口本身会执行真实副作用（/api/wb_assets 会打上游）。
+                    // 现在只放行主文档（isForMainFrame）发起的请求。
+                    if (request.isForMainFrame != true) {
+                        return jsonResponse("""{"error":"forbidden"}""")
+                    }
                     val method = (request.method ?: "GET").uppercase()
                     if (method != "GET" && method != "HEAD") {
                         return jsonResponse(
@@ -747,9 +756,13 @@ class WebUiActivity : ComponentActivity() {
         private fun trusted(): Boolean {
             val u = pageUrl
             if (u.isEmpty()) {
-                // 页面回调还没到（极早期调用）。放行 —— 宁可少拦一次，
-                // 也不能让首屏 loadAll 全部 forbidden。
-                return true
+                // M5（BUGS-v2.61）：原来这里 return true（「宁可少拦一次」），
+                // 但 pageUrl 为空恰恰是「页面还没起来」或「WebView 已被导航走、
+                // 回调没来得及更新」这两个最危险的时刻 —— 此时任何能执行 JS 的
+                // 上下文（被劫持的第三方页、注入的 iframe）都能直接调桥读写
+                // /api（含凭据与签到触发）。默认拒绝，让首屏多一次重试的代价
+                // 远小于「空串即全通」。
+                return false
             }
             return u.startsWith("https://appassets.androidplatform.net/") ||
                 u == "https://appassets.androidplatform.net"
@@ -849,10 +862,13 @@ class WebUiActivity : ComponentActivity() {
             }
         }
 
-        /** 打开系统的无障碍设置（无障碍兜底执行器 AutoClickService 需要用户手动开启） */
+        // H2（BUGS-v2.61）：openAccessibility 桥方法已移除 —— 它指向的
+        // AutoClickService 已整体删除（占位包名 + 可读全机窗口 + 前端零调用）。
+        // 这里保留一个空实现只为兼容老缓存页面里可能残留的 bridge.openAccessibility()
+        // 调用，不打开任何系统设置页。
         @JavascriptInterface
         fun openAccessibility() {
-            runOnUiThread { openAccessibilitySettings() }
+            // no-op：无障碍服务已移除（V2.62）
         }
 
         @JavascriptInterface
@@ -1222,23 +1238,14 @@ class WebUiActivity : ComponentActivity() {
         } catch (_: Exception) {}
     }
 
-    // ---------------- 无障碍设置（AutoClickService 兜底执行器） ----------------
-    @Suppress("unused")
-    private fun isAccessibilityEnabled(): Boolean {
-        val want = "$packageName/${AutoClickService::class.java.name}"
-        val enabled = android.provider.Settings.Secure.getString(
-            contentResolver, android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        ) ?: ""
-        return enabled.split(':').any { it.equals(want, ignoreCase = true) }
-    }
-
-
-    fun openAccessibilitySettings() {
-        try {
-            startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (_: Exception) {}
-    }
+    // H2（BUGS-v2.61）：无障碍兜底执行器 AutoClickService 已整体删除。
+    // 理由：它的目标包名 com.workbuddy.app / com.trae.solo 是**从未验证的占位值**
+    // （docs/REVIEW.md P3-14、README.md:505 都写了「按实际包名改」），而配置里
+    // canRetrieveWindowContent=true + flagRetrieveInteractiveWindows 且没有
+    // packageNames —— 等于声明「能读全机所有应用的窗口内容」，却一个真实目标都
+    // 打不中。前端也从未调用 openAccessibility()。保留它只有风险没有功能。
+    // 相关文件（AndroidManifest service 声明、res/xml/accessibility_service_config.xml、
+    // strings 里的 accessibility_desc）一并移除。
 
     override fun onDestroy() {
         try { apiExecutor.shutdownNow() } catch (_: Exception) {}

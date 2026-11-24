@@ -12,14 +12,41 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # backend/
 DATA_DIR = Path(os.environ.get("SIGNBOT_DATA", BASE_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def harden_perm(path, mode: int) -> None:
+    """
+    把 path 的权限收紧到 mode（POSIX）。Windows 上 chmod 只能切只读位，
+    这里直接跳过 —— 那边靠 ACL 与 DPAPI，不靠位掩码。
+
+    BUGS-v2.61 的 H3：config.json 里放的是加密后的凭据，但**密钥文件**
+    （vault.key）与 SQLite 库仍是敏感物，权限必须是 0600 / 0700。
+    原来的代码全程没有 chmod，实测落盘是 666。
+    """
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def tighten_data_dir() -> None:
+    """数据目录 0700：别的本地用户不该能列目录、更不该能读里面的文件。"""
+    harden_perm(DATA_DIR, 0o700)
+
 CONFIG_PATH = DATA_DIR / "config.json"
 DB_PATH = DATA_DIR / "signbot.db"
 
 DEFAULT_CONFIG = {
     "server": {
+        # 手机 App 要能连，所以默认仍然监听全网卡（0.0.0.0）。
+        # H4（BUGS-v2.61）：这条的安全性不再靠「空口令只读放行」撑着 ——
+        # 后端启动时若发现 api_token 为空，会**自动生成**一个 24 字节随机口令
+        # 写进 config.json 并在启动横幅里打印一次（见 server.serve）。
+        # 想要「局域网免口令」必须自己显式把 api_token 设成空串并重启。
         "host": "0.0.0.0",
         "port": 8787,
-        # 手机 App 访问后端所用令牌，留空表示不校验（局域网自测可留空）
+        # 手机 App 访问后端所用令牌；为空时启动会自动生成
         "api_token": "",
         # 局域网控制台（BUGS-v2.40 P0）：默认只允许「本机回环 / App 自带页面 /
         # 本机自己的局域网 IP + 本服务端口」作为浏览器来源。要让别的机器上的
@@ -282,9 +309,14 @@ def _save_locked(cfg: dict) -> None:
     except Exception:
         pass
     tmp = CONFIG_PATH.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
+    # H3：先建 0600 的临时文件再写 —— 不要「先 open 写、写完再 chmod」，
+    # 中间那段窗口里文件是默认权限，同机别的用户能读到密文与密钥路径。
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w", encoding="utf-8") as f:
         json.dump(disk, f, ensure_ascii=False, indent=2)
+    harden_perm(tmp, 0o600)
     os.replace(tmp, CONFIG_PATH)
+    harden_perm(CONFIG_PATH, 0o600)
 
 
 def update_config(mutator) -> dict:

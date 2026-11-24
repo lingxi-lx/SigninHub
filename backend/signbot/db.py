@@ -6,7 +6,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
-from .config import DB_PATH
+from .config import DB_PATH, harden_perm, tighten_data_dir
 
 _LOCK = threading.Lock()
 
@@ -14,7 +14,10 @@ _LOCK = threading.Lock()
 @contextmanager
 def _conn():
     with _LOCK:
+        # H3（BUGS-v2.61）：库文件里有签到明细与账号标识，权限必须 0600。
+        # 首次连接会创建文件，所以在 connect 之后立刻收紧。
         conn = sqlite3.connect(str(DB_PATH), timeout=30)
+        harden_perm(DB_PATH, 0o600)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -24,6 +27,7 @@ def _conn():
 
 
 def init_db() -> None:
+    tighten_data_dir()
     with _conn() as c:
         c.executescript(
             """

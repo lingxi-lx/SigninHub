@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
@@ -16,6 +17,7 @@ import java.time.Instant
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.ZoneId
+import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
 /**
@@ -135,6 +137,14 @@ object AutoCheckinScheduler {
                 Constraints.Builder()
                     .setRequiredNetworkType(NetworkType.CONNECTED)
                     .build()
+            )
+            // L15（BUGS-v2.61）：原来 Result.retry() 走 WorkManager 默认退避
+            // （30 秒线性），上游抖动时几秒内就连撞三四次。改成指数退避、
+            // 30 秒起，第一次 30s → 60s → 120s …（上限由 WorkManager 控在 5 小时）。
+            .setBackoffCriteria(
+                BackoffPolicy.EXPONENTIAL,
+                30,
+                TimeUnit.SECONDS
             )
             .addTag(WORK_NAME_NOW)
             .build()

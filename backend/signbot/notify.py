@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import db
+from . import db, netguard
 
 KINDS = ("wecom", "dingtalk", "feishu", "pushplus", "serverchan", "bark", "wxpusher", "generic")
 
@@ -40,8 +40,11 @@ def _post_json(url: str, payload: dict, timeout: int = 10):
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.status, r.read(4000).decode("utf-8", "replace")
+    # 出站目标校验：url 来自用户填的 webhook，必须过 netguard 的地址/协议/跳转检查
+    try:
+        return netguard.open_checked(req, timeout=timeout)
+    except netguard.BlockedTarget as e:
+        raise PushError(str(e))
 
 
 def _post_form(url: str, fields: dict, timeout: int = 10):
@@ -52,8 +55,10 @@ def _post_form(url: str, fields: dict, timeout: int = 10):
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.status, r.read(4000).decode("utf-8", "replace")
+    try:
+        return netguard.open_checked(req, timeout=timeout)
+    except netguard.BlockedTarget as e:
+        raise PushError(str(e))
 
 
 def _normalize_kind(kind: str) -> str:
