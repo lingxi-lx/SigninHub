@@ -22,7 +22,7 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web")
 
 # 与 android/app/build.gradle.kts 的 versionName 保持一致：改版本时两处一起改。
 # 前端设置页「高级」里会显示这个号，用来确认装的/连的是哪一版。
-APP_VERSION = "2.49"
+APP_VERSION = "2.61"
 
 # 视为「仅本机可访问」的监听地址（启动横幅据此决定是否打安全提示）
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "")

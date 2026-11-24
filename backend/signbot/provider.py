@@ -433,7 +433,7 @@ def readiness(key: str, pcfg: dict, data_dir: str = None, light: bool = False) -
             issues.append("缺少华为会话 Cookie：点「登录华为码道」在站内登录一次即可自动采集")
         hints = []
         if p.get("token_ok") and not p.get("has_cftk"):
-            hints.append("Cookie 里没有 devclouddevuibtcftk（CSRF 令牌），领取会被拒 —— 建议重新登录一次")
+            hints.append("Cookie 里没有 devclouddevuibjtcftk（CSRF 令牌），领取会被拒 —— 建议重新登录一次")
         # 删掉过时的「未配置码道门户 Cookie」提示（BUGS-v2.48 P3-4）：
         # huawei.py 里 portal_ok 已重新定义成「会话可用」（quick() 的 "portal_ok": ok、
         # probe() 的 "portal_ok": has_session(cookie)），而进入这条 if 的前提是 token_ok 为真

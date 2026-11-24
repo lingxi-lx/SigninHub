@@ -168,10 +168,11 @@ object LocalCheckin {
     private fun traeDeviceFailMsg(dev: String): String =
         "被 Trae 风控拦了（code=9074 = ErrWorkRiskControlBanned，不是「设备没注册」——" +
             "那是 9095）。上游文案「当前参与用户太多」是套话，等几分钟没用。" +
-            "v2.19 已修掉两个诱因：补回桌面端 UA（v2.18 曾误删，导致发的是 okhttp/4.x）、" +
-            "设备号改为一次写定不再重算。当前设备号 $dev。" +
-            "建议：① 先点「测试签到」重试一次；" +
-            "② 若仍失败，说明该账号已被风控记了一笔，等 12~24 小时再试；" +
+            "当前设备号 $dev。" +
+            "最常见的原因是使用顺序：账号在官网刚注册、还没正常用过，就先被本软件拿来签到。" +
+            "建议：① 先到 trae.cn 官网正常登录用一会儿（写几行代码、开一次会话都算），" +
+            "隔几小时（最好隔一天）再回来签；" +
+            "② 已经报 9074 的，等 12~24 小时再试；" +
             "③ 期间不要改设备号、也不要反复点测试（每次调用都会被记一次）。"
 
     /**
@@ -1598,7 +1599,7 @@ object LocalCheckin {
     //
     // 头组是硬要求：缺任何一个，华为就把请求当普通页面访问、回 SPA 的 HTML 而不是
     // JSON —— 表现是「解析失败」而不是 401，排查时极具误导性。`cftk` 是 CSRF 令牌，
-    // 值来自 cookie `devclouddevuibtcftk`。
+    // 值来自 cookie `devclouddevuibjtcftk`。
     // ═══════════════════════════════════════════════════════════════════════
 
     private const val HW_BASE = "https://devcloud.cn-north-4.huaweicloud.com/chat/PromptCenterService"
@@ -1645,16 +1646,22 @@ object LocalCheckin {
     // 只认复数写法时，若服务端返单数就永远判不出「已签」，
     // 症状是「明明签了，软件还显示签到入口」。
     private val HW_DONE_STATES = listOf("CLAIMED", "CONFIRMED", "CONSUMED", "CONFIRM", "CONSUME")
+    // 活动已结束（卖完 / 窗口关闭）—— 竞答类活动的终态。
+    private val HW_ENDED_STATES = listOf("SOLD_OUT", "WINDOW_ENDED")
+    // 任务型活动（要做任务才可领）的 taskMode 取值。
+    private val HW_TASK_MODES = listOf("CONTINUOUS", "NON_CONTINUOUS")
     // 每日签到活动的 type。前端 w_() 同时认大写与 snake 写法。
     //
-    // ⚠️ USER_LOGIN 必须与 DAILY_CLAIM **分开**（v2.42 修的事故）：
-    // delivery 列表里「新用户登录即送 4000 积分」(USER_LOGIN) 与「每日签到领 100
-    // 积分」(DAILY_CLAIM) 是两条同时存在的活动。老代码把两者塞进同一个池子、
-    // 谁先 ELIGIBLE 就返回谁 → 领的是登录礼，每日签到一动没动，回读自然还是
-    // ELIGIBLE，于是报出「领取接口返回成功，但活动状态仍是 ELIGIBLE」的假失败。
-    private val HW_DAILY_TYPES = listOf("DAILY_CLAIM", "DAILY_CHECKIN", "DAILY_CHECK_IN", "DAILY_SIGN_IN")
-    // 登录礼类：只在没有任何每日签到活动时才退而求其次（例如新号首日）。
-    private val HW_LOGIN_TYPES = listOf("USER_LOGIN", "USER_LOGIN_DAILY")
+    // ⚠️ **USER_LOGIN 就是「每日签到领积分」本身**（v2.50 纠正 v2.42 的误判）。
+    // 用户 m25808 的实机红字是 `type=USER_LOGIN、campaignId=34`，而码道客户端里
+    // 这一项的名字正是「每日签到领 10…积分」。v2.42 时我把它当成「新用户登录礼」
+    // 并刻意降级 —— 那个结论来自营销文案 `loginPromptText`（「新用户登录即送 4000
+    // 积分，每日签到可领取 1000 积分」）的猜测，不是证据。华为是把「登录」当成
+    // 签到任务的动作来登记活动的，type 叫什么与「能不能天天领」无关。
+    private val HW_DAILY_TYPES = listOf(
+        "DAILY_CLAIM", "DAILY_CHECKIN", "DAILY_CHECK_IN", "DAILY_SIGN_IN",
+        "USER_LOGIN", "USER_LOGIN_DAILY"
+    )
     // 单次最多领几个 benefit（防 claimActions 异常长时打爆上游）
     private const val HW_MAX_BENEFITS = 6
     // 事件上报端点。码道前端进站第一件事就是 o7t()：
@@ -1665,8 +1672,66 @@ object LocalCheckin {
     // 所以这类活动在我们眼里可能一直不可领（或领了不翻状态）。
     private const val HW_EVENTS = "/v1/ops/events/trigger"
     private const val HW_LOGIN_EVENT = "user.login"
+
+    /**
+     * `campaign.read` 事件（对齐码道前端 `QPt()`）。
+     *
+     * 前端在活动列表**被渲染出来**时发（RedDot chunk 的 `markRead()`）：
+     *
+     * ```js
+     * body: { triggerEvent: "campaign.read", readCampaignIds: a,
+     *         idempotentKey: `read_${a.join("_")}`, channel: t }
+     * ```
+     *
+     * 码道的任务型活动靠「读过」推进 `taskStatus`，不发这个事件时 `taskStatus`
+     * 可能一直停在空/IN_PROGRESS，claim 就成了空操作 —— 用户 m26306 那条
+     * 「status=ELIGIBLE taskStatus=- claimable=true」正是这个形态。
+     * `idempotentKey` 只由 cids 决定（不含时间戳），重复发是幂等的。
+     */
+    private const val HW_READ_EVENT = "campaign.read"
+
+    /**
+     * 任务进度端点。
+     *
+     * 码道前端的 `taskMode` / `taskStatus` / `taskCurrent` / `taskThreshold` /
+     * `benefitStatus` **不在 delivery 里**，而是从
+     * `GET /v1/ops/tasks/conversation?channel=WEB` 单独取回，再按 `campaignId`
+     * 合并进活动对象（前端 `p_` 那个 computed）：
+     *
+     * ```js
+     * const p_ = computed(() => u.value.map(I => {
+     *   const F = y_(I), j = p.value[F.id];
+     *   return j && (F.taskCurrent = j.current, F.taskThreshold = j.threshold,
+     *                F.taskMode = j.mode, F.taskBenefitStatus = j.benefitStatus,
+     *                F.taskNeedRemindToday = j.needRemindToday,
+     *                F.taskStatus = j.taskStatus), F
+     * }));
+     * ```
+     *
+     * 只读 delivery 的话 `taskStatus` 恒空，[hwClaimed] 的任务型分支永远为假
+     * —— 用户 m26306 那条「taskStatus=- claimable=true」就是这么来的。
+     */
+    private const val HW_TASKS = "/v1/ops/tasks/conversation"
+
+    /** confirm 之后回读状态的重试次数与间隔（码道任务状态是异步结算的）。 */
+    private const val HW_READBACK_RETRIES = 3
+    private const val HW_READBACK_GAP_MS = 1500L
     private val HW_SESSION_NAMES = listOf("devclouddevuibjJ_SESSION_ID", "J_SESSION_ID")
-    private const val HW_CFTK_COOKIE = "devclouddevuibtcftk"
+    // CSRF 令牌的 cookie 名 —— 逐字对齐首页 HTML 里硬写的那个：
+    //
+    //   window['cftk_cookie_key_cf2'] = 'devclouddevuibjtcftk';
+    //
+    // v2.57 及之前写成 devclouddevuibtcftk（**少一个 j**），于是 cftk 头恒空、
+    // 服务端回 csrf validate fail.（用户 m27543）。这个前缀与
+    // devclouddevuibjJ_SESSION_ID 相同，少一个字母肉眼极难发现。
+    private const val HW_CFTK_COOKIE = "devclouddevuibjtcftk"
+
+    // 兜底候选：按序找，第一个非空的胜出（老部署可能用旧写法或裸 cftk）
+    private val HW_CFTK_CANDIDATES = listOf(
+        "devclouddevuibjtcftk",
+        "devclouddevuibtcftk",
+        "cftk",
+    )
 
     /**
      * cookie 里是否带了华为会话标识。
@@ -1737,15 +1802,80 @@ object LocalCheckin {
         return false
     }
 
-    /** 从 cookie 串里取 CSRF 令牌（`cftk` 头的值）。 */
+    /**
+     * Cookie 里有没有 CSRF 令牌（`cftk`）。
+     *
+     * 供 `LocalApi` 的体检面板用 —— 以前它自己写死了 `contains("devclouddevuibtcftk=")`，
+     * 那个名字少一个 `j`（v2.57 及之前的错误），于是体检永远报「缺 CSRF 令牌」，
+     * 而实际签到那边也一样取不到值，症状是 `csrf validate fail.`。
+     * 现在统一走这里，只有一处真相。
+     */
+    fun hwHasCftk(cookie: String): Boolean = hwCftk(cookie).isNotBlank()
+
+    /**
+     * 从 cookie 串里取 CSRF 令牌（`cftk` 头的值）。
+     *
+     * 两条都必须照抄前端，否则服务端回 `csrf validate fail.`：
+     *
+     * 1. **cookie 名逐字对齐** —— 前端 `tae.getItem(t)` 按名精确比对，
+     *    首页 HTML 里写的是 `devclouddevuibjtcftk`（前缀 `devclouddevuibj`，
+     *    少一个 `j` 就永远取不到）。v2.57 及之前写成了 `devclouddevuibtcftk`，
+     *    于是 `cftk` 头恒空 → 服务端直接 `csrf validate fail.`（用户 m27543）。
+     * 2. **值要 URL 解码** —— 前端写 cookie 时 `encodeURIComponent`，读回来
+     *    `decodeURIComponent`。令牌里常含 `%2B`(`+`)、`%2F`(`/`)，不解码等于发错令牌。
+     */
     private fun hwCftk(cookie: String): String {
+        if (cookie.isBlank()) return ""
+        val pairs = LinkedHashMap<String, String>()
         cookie.split(";").forEach { raw ->
             val part = raw.trim()
-            if (part.startsWith("$HW_CFTK_COOKIE=")) {
-                return part.substring(HW_CFTK_COOKIE.length + 1).trim()
-            }
+            val eq = part.indexOf('=')
+            if (eq <= 0) return@forEach
+            pairs[part.substring(0, eq).trim()] = part.substring(eq + 1).trim()
+        }
+        for (name in HW_CFTK_CANDIDATES) {
+            val raw = pairs[name] ?: ""
+            if (raw.isBlank()) continue
+            val out = hwPctDecode(raw)
+            if (out.isNotBlank()) return out
         }
         return ""
+    }
+
+    /**
+     * 只解 `%XX`，**不把 `+` 当空格** —— 等价于 JS 的 `decodeURIComponent`。
+     *
+     * 不能用 `java.net.URLDecoder.decode`：那是 `application/x-www-form-urlencoded`
+     * 的解码器，会把 `+` 转成空格。CSRF 令牌是 base64 风格的字符串，`+` 是
+     * 合法字符，一转空格就等于发了个错令牌，服务端照样回 `csrf validate fail.`
+     * 而症状和「取不到令牌」完全一样，极难查。
+     */
+    private fun hwPctDecode(s: String): String {
+        if (s.indexOf('%') < 0) return s
+        val out = StringBuilder(s.length)
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c == '%' && i + 2 < s.length) {
+                val hex = s.substring(i + 1, i + 3)
+                val v = hex.toIntOrNull(16)
+                if (v != null) {
+                    out.append(v.toChar())
+                    i += 3
+                    continue
+                }
+            }
+            out.append(c)
+            i++
+        }
+        // 多字节 UTF-8 会被拼成一串字节，这里按 UTF-8 重新组装；
+        // 令牌通常是 ASCII，走不到这条分支。
+        val bytes = out.toString().toByteArray(Charsets.ISO_8859_1)
+        return try {
+            String(bytes, Charsets.UTF_8)
+        } catch (_: Exception) {
+            out.toString()
+        }
     }
 
     /**
@@ -1843,38 +1973,152 @@ object LocalCheckin {
             )
         }
         return try {
-            Triple(JSONObject(t), "", false)
+            val doc = JSONObject(t)
+            // CSRF 失败是最容易误判的一种：HTTP 200、JSON 合法、只有一句英文。
+            // 单看它像「业务失败」，实际是「我们没把 cftk 头带对」——
+            // 翻译成人话，否则用户只看到 csrf validate fail. 以为是华为封号了。
+            val errText = doc.optString("error", "") + " " + doc.optString("message", "")
+            if (errText.lowercase().contains("csrf")) {
+                val tk = hwCftk(cookie)
+                val why = if (tk.isBlank()) {
+                    "CSRF 令牌没取到（csrf validate fail.）：采集到的 Cookie 里没有 $HW_CFTK_COOKIE。" +
+                        "华为把 CSRF 令牌放在这个 cookie 里，缺它任何写操作都会被拒。" +
+                        "请重新「登录华为码道」采集一次；若反复出现请把这条发给我"
+                } else {
+                    "CSRF 校验失败（csrf validate fail.）：Cookie 里的 $HW_CFTK_COOKIE 已失效或与会话不匹配。" +
+                        "华为的 CSRF 令牌跟会话一起过期，请重新「登录华为码道」采集一次"
+                }
+                return Triple(null, why, false)
+            }
+            Triple(doc, "", false)
         } catch (e: Exception) {
             Triple(null, "华为接口返回的 JSON 解析失败：${e.message}（前 80 字符：${t.take(80)}）", false)
         }
     }
 
     /**
+     * 这个响应算不算成功 —— 逐字对齐码道前端的 `$s()`（v2.54 修正）。
+     *
+     * ```js
+     * function $s(e){
+     *   return e.code===0 || e.code===200 || (e.data!==undefined && e.data!==null)
+     *     ? {success:!0, data:e.data}
+     *     : {success:!1, error:e.message||("error_code="+e.code), code:e.code};
+     * }
+     * ```
+     *
+     * ⚠️ v2.53 及之前判的是 `optInt("code", 0) == 0` —— `optInt` 在字段缺失时
+     * 返回默认值 0，**等于「没有 code 字段就一律当成功」**。码道业务失败时经常返回
+     * `{"success": false, "error": "..."}` 这种没有 `code` 的形状，于是我们把
+     * 「领取失败」当成「领取成功」，接着去 confirm、去回读，状态当然一动不动，
+     * 最后报出一句「领取接口返回成功，但活动仍未翻状态」—— 用户 m26896 那条文案。
+     *
+     * 现在三条都要求：`code` 显式为 0 / 200，或者 `data` 非空；
+     * `success is False` 直接判失败（比前端更严，因为我们要据此决定是否写今日标记）。
+     */
+    private fun hwRespOk(doc: JSONObject?): Boolean {
+        if (doc == null) return false
+        if (doc.has("success") && !doc.optBoolean("success", true)) return false
+        if (!doc.has("code")) return !doc.isNull("data") && doc.opt("data") != null
+        val code = doc.optInt("code", -1)
+        if (code == 0 || code == 200) return true
+        return false
+    }
+
+    /** 把失败响应压成一句给人看的原因。 */
+    private fun hwRespErr(doc: JSONObject?): String {
+        if (doc == null) return "响应为空"
+        val code = if (doc.has("code")) doc.opt("code")?.toString() else null
+        var msg = doc.optString("message", "")
+        if (msg.isBlank()) msg = doc.optString("msg", "")
+        if (msg.isBlank()) {
+            val err = doc.opt("error")
+            msg = when (err) {
+                is JSONObject -> err.optString("message", err.optString("code", ""))
+                is String -> err
+                else -> ""
+            }
+        }
+        msg = msg.take(140)
+        return when {
+            code == null -> msg.ifBlank { "业务失败（响应没有 code 字段）" }
+            msg.isBlank() -> "code=$code"
+            else -> "code=$code $msg"
+        }
+    }
+
+    /**
+     * 这个活动**还能不能领**？—— 逐字对齐码道前端 `GPt()`。
+     *
+     * ```js
+     * const ELIGIBLE="ELIGIBLE", DONE=["CLAIMED","CONFIRMED","CONSUMED"], ENDED=["SOLD_OUT","WINDOW_ENDED"];
+     * function Uoe(e){ return (e??[]).some(t=>t.status==="ELIGIBLE") }   // 子项还有可领
+     * function GPt(e){                                                   // true = 已领过 / 不可领
+     *   return Uoe(e.claimActions) ? !1
+     *     : $oe(e) ? (!!e.status && ENDED.includes(e.status))
+     *     : (e.taskMode==="CONTINUOUS"||e.taskMode==="NON_CONTINUOUS")
+     *         ? (e.taskStatus==="COMPLETED" && e.claimable===!1)
+     *         : (e.status!==null && e.status!==void 0 && e.status!=="ELIGIBLE");
+     * }
+     * ```
+     *
+     * 这是 v2.50 修的第二个根因：以前只看 `status in HW_DONE_STATES`，
+     * 而 `status` 会一直停在 `ELIGIBLE`（用户 m25808 的截图就是这样），
+     * 真正的「已领」证据藏在另外两个地方：
+     *
+     * 1. **有 claimActions** —— 只要子项里还有一个 ELIGIBLE 就没领完，全部非
+     *    ELIGIBLE 才算领完。这种情况下父活动的 `status` 不可信。
+     * 2. **任务型（taskMode）** —— 看 `taskStatus == COMPLETED` 且 `claimable === false`。
+     * 3. 其余（普通活动）才回落到 `status` 判据。
+     *
+     * 返回 true 表示「已领完 / 不可再领」。
+     */
+    private fun hwClaimed(camp: JSONObject?): Boolean {
+        if (camp == null) return false
+        val acts = camp.optJSONArray("claimActions")
+        if (acts != null && acts.length() > 0) {
+            for (i in 0 until acts.length()) {
+                val a = acts.optJSONObject(i) ?: continue
+                if (a.optString("status", "").uppercase() == "ELIGIBLE") return false
+            }
+            return true
+        }
+        val mode = camp.optString("taskMode", "").uppercase()
+        if (HW_TASK_MODES.contains(mode)) {
+            return camp.optString("taskStatus", "").uppercase() == "COMPLETED" &&
+                camp.has("claimable") && !camp.optBoolean("claimable", true)
+        }
+        val state = camp.optString("status", "").uppercase()
+        if (state.isBlank()) return false
+        return state != "ELIGIBLE"
+    }
+
+    /** 能不能领 —— [hwClaimed] 的否定，外加「活动已结束」也排除。 */
+    private fun hwClaimable(camp: JSONObject?): Boolean {
+        if (camp == null) return false
+        if (hwClaimed(camp)) return false
+        return !HW_ENDED_STATES.contains(camp.optString("status", "").uppercase())
+    }
+
+    /**
      * 从活动列表里挑出**每日签到**活动。
      *
-     * 判据顺序（对齐码道前端 `w_()` 的活动类型归一 + 用户实机看到的列表）：
+     * 判据（对齐码道前端 `GPt()` / `Uoe()` 与用户实机看到的列表）：
      *
-     * 1. **每日签到类**（[HW_DAILY_TYPES]）优先，其次才是「登录礼」类（[HW_LOGIN_TYPES]）。
-     *    这一步是 v2.42 修的关键：`USER_LOGIN`（「新用户登录即送 4000 积分」）与
-     *    `DAILY_CLAIM`（「每日签到领 100 积分」）在 delivery 里**同时存在**，
-     *    老代码把两者混在一个列表里、谁先 ELIGIBLE 就返回谁 —— 结果领的是
-     *    「登录礼」，每日签到一动没动，回读自然还是 ELIGIBLE（m23825 截图）。
-     * 2. 同一优先级内优先 `status == ELIGIBLE`；
-     * 3. `campaignId == 1`（2026-10 之前的老轮次写法）；
-     * 4. 兜底：全表只有一个可领项时才认它。
+     * 1. `type` 属于 [HW_DAILY_TYPES]（已含 USER_LOGIN）的优先；
+     * 2. 同一优先级内优先**还能领**的（[hwClaimable]），而不是只比 status == ELIGIBLE；
+     * 3. 再退到「全表唯一还能领的那个」；
+     * 4. 最后 `campaignId == 1`（2026-10 之前的老轮次写法）。
      */
     private fun hwFindDaily(items: List<JSONObject>): JSONObject? {
         fun pick(pool: List<JSONObject>): JSONObject? =
-            pool.firstOrNull { it.optString("status", "").uppercase() == "ELIGIBLE" }
-                ?: pool.firstOrNull()
+            pool.firstOrNull { hwClaimable(it) } ?: pool.firstOrNull()
 
         pick(items.filter { HW_DAILY_TYPES.contains(it.optString("type", "").uppercase()) })
             ?.let { return it }
-        pick(items.filter { HW_LOGIN_TYPES.contains(it.optString("type", "").uppercase()) })
-            ?.let { return it }
+        val alive = items.filter { hwClaimable(it) }
+        if (alive.size == 1) return alive[0]
         items.firstOrNull { it.optInt("campaignId", -1) == 1 }?.let { return it }
-        val eligible = items.filter { it.optString("status", "").uppercase() == "ELIGIBLE" }
-        if (eligible.size == 1) return eligible[0]
         return null
     }
 
@@ -1910,11 +2154,10 @@ object LocalCheckin {
         }
         val (doc, err, authFail) = hwApi(HW_DELIVERY, cookie)
         if (doc == null) return HwDelivery(null, emptyList(), err, authFail)
-        val c = doc.optInt("code", 0)
-        if (c != 0) {
+        if (!hwRespOk(doc)) {
             return HwDelivery(
                 null, emptyList(),
-                "华为活动查询失败 code=$c ${doc.optString("message", "").take(120)}",
+                "华为活动查询失败 ${hwRespErr(doc)}",
                 // 业务码非 0：可能是活动下线，也可能是登录态被服务端判无效。
                 // 不当作登录态问题 —— 免得把「活动换轮次」误记成「未登录」。
                 false,
@@ -1925,9 +2168,63 @@ object LocalCheckin {
         if (items != null) for (i in 0 until items.length()) {
             items.optJSONObject(i)?.let { list.add(it) }
         }
+        hwMergeTasks(list, hwFetchTasks(cookie))
         val camp = hwFindDaily(list)
             ?: return HwDelivery(null, list, "未找到每日签到活动（活动可能已下线或换轮次）", false)
         return HwDelivery(camp, list, "")
+    }
+
+    /**
+     * 取回任务进度，按 campaignId 建索引。
+     *
+     * 对齐码道前端 `rFt()`（`GET /v1/ops/tasks/conversation?channel=WEB`）。
+     * 失败一律返空 Map —— 任务进度只是**补充证据**，拿不到不该阻断签到
+     * （delivery 里的 `claimActions` / `status` 仍然可用）。
+     */
+    private suspend fun hwFetchTasks(cookie: String): Map<String, JSONObject> {
+        if (!hwHasSession(cookie)) return emptyMap()
+        val (doc, _err, _af) = hwApi(HW_TASKS + "?channel=WEB", cookie)
+        if (doc == null) return emptyMap()
+        val data = doc.optJSONArray("data")
+            ?: doc.optJSONObject("data")?.optJSONArray("items")
+            ?: return emptyMap()
+        val out = HashMap<String, JSONObject>()
+        for (i in 0 until data.length()) {
+            val t = data.optJSONObject(i) ?: continue
+            val cid = t.opt("campaignId") ?: continue
+            out[cid.toString()] = t
+        }
+        return out
+    }
+
+    /**
+     * 把任务进度合并进活动对象（原地改）。
+     *
+     * 逐字对齐码道前端 `p_`：
+     * `F.taskCurrent = j.current; F.taskThreshold = j.threshold; F.taskMode = j.mode;
+     *  F.taskBenefitStatus = j.benefitStatus; F.taskNeedRemindToday = j.needRemindToday;
+     *  F.taskStatus = j.taskStatus;`
+     *
+     * ⚠️ 最后一个字段是 `j.taskStatus`，**不是 `j.status`**。
+     * v2.53 这里写成了 `"status" to "taskStatus"`，而 tasks 接口的对象里
+     * 这个字段名就叫 `taskStatus` —— 于是 `t.has("status")` 恒为假，
+     * 合并完 `taskStatus` 仍是空，症状与「根本没合并」完全一样
+     * （用户 m26896 截图：`taskStatus=-`）。前五个字段名恰好两边同名，
+     * 只有这一个不同名，所以肉眼扫过去很难发现。
+     */
+    private fun hwMergeTasks(items: List<JSONObject>, tasks: Map<String, JSONObject>) {
+        if (tasks.isEmpty()) return
+        val pairs = arrayOf(
+            "current" to "taskCurrent", "threshold" to "taskThreshold",
+            "mode" to "taskMode", "benefitStatus" to "taskBenefitStatus",
+            "needRemindToday" to "taskNeedRemindToday", "taskStatus" to "taskStatus",
+        )
+        items.forEach { x ->
+            val t = tasks[x.optInt("campaignId", -1).toString()] ?: return@forEach
+            pairs.forEach { (src, dst) ->
+                if (t.has(src)) x.put(dst, t.opt(src))
+            }
+        }
     }
 
     /** 查活动列表。返回 (活动, 错误)。 */
@@ -1976,7 +2273,66 @@ object LocalCheckin {
             .toString()
         val (_doc, _e, _af) = hwApi(HW_EVENTS, cookie, "POST", body)
         if (_doc == null) return false
-        return _doc.optInt("code", 0) == 0
+        val ok = hwRespOk(_doc)
+        if (ok) hwMarkLoginReported(cookie)
+        return ok
+    }
+
+    /**
+     * 上报 `campaign.read`。返回是否成功。
+     *
+     * 对齐码道前端 `QPt()`：`idempotentKey` 只由 cids 决定（`read_<ids 排序后 join "_">`），
+     * 不带时间戳 —— 重复发是幂等的，服务端只记一条。
+     */
+    private suspend fun hwTriggerRead(cookie: String, cids: List<Int>): Boolean {
+        if (!hwHasSession(cookie)) return false
+        val ids = cids.filter { it >= 0 }.distinct().sorted()
+        if (ids.isEmpty()) return false
+        val body = JSONObject()
+            .put("triggerEvent", HW_READ_EVENT)
+            .put("readCampaignIds", org.json.JSONArray(ids))
+            .put("idempotentKey", "read_" + ids.joinToString("_"))
+            .put("channel", "WEB")
+            .toString()
+        val (doc, _e, _af) = hwApi(HW_EVENTS, cookie, "POST", body)
+        return hwRespOk(doc)
+    }
+
+    /**
+     * 今天是否已经上报过 `user.login`（进程内去重）。
+     *
+     * 前端用 `localStorage["lastLoginReportDate"]` 去重，**每次页面加载最多发一次**
+     * （`vn().isLoggedIn && a7t()`）。`LocalCheckin` 是 `object`、拿不到 Context，
+     * 所以这里用进程内变量模拟同样的语义：一次 App 生命周期内只发一次，
+     * 用户反复点「测试签到」不会刷出一串事件。
+     *
+     * 跨进程重启会再发一次 —— 与前端「重开页面就再发一次」完全一致，
+     * 服务端只记一条事件，不会把签到判成异常流量。
+     */
+    @Volatile
+    private var hwLoginDay: String = ""
+
+    private fun hwLoginReportedToday(cookie: String): Boolean {
+        val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("Asia/Shanghai"))
+        val today = String.format(
+            java.util.Locale.US, "%04d-%02d-%02d",
+            cal.get(java.util.Calendar.YEAR),
+            cal.get(java.util.Calendar.MONTH) + 1,
+            cal.get(java.util.Calendar.DAY_OF_MONTH),
+        )
+        return hwLoginDay == today + "|" + HwAccount.keyOf(cookie)
+    }
+
+    /** 记下「今天已上报 user.login」。 */
+    private fun hwMarkLoginReported(cookie: String) {
+        val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("Asia/Shanghai"))
+        val today = String.format(
+            java.util.Locale.US, "%04d-%02d-%02d",
+            cal.get(java.util.Calendar.YEAR),
+            cal.get(java.util.Calendar.MONTH) + 1,
+            cal.get(java.util.Calendar.DAY_OF_MONTH),
+        )
+        hwLoginDay = today + "|" + HwAccount.keyOf(cookie)
     }
 
     /**
@@ -2103,16 +2459,25 @@ object LocalCheckin {
             // 上层据此把账号记成「未登录」，别靠匹配中文文案。
             return CheckinResult("huawei", "fail", d0.err, "", authFailed = d0.authFailed)
         }
-        // 活动不是「已领」也不是「可领」时，先补一次 user.login 事件再重查 ——
-        // 这是码道前端进站必做的事，不发的话 USER_LOGIN 类活动可能一直不进入 ELIGIBLE。
+        // ── 进站第一件事：无条件上报 user.login（对齐前端 a7t()）──
+        // 前端是 `vn().isLoggedIn && a7t()`，只靠 localStorage 日期去重，
+        // **不看活动状态**。以前我们只在「既不可领也未领」时才发，条件太窄：
+        // 用户 m26306 那次 claimable=true 且 taskStatus 为空，事件压根没发，
+        // 服务端自然没理由把 USER_LOGIN 任务标成 COMPLETED，于是 claim 200 但状态永不翻。
         var camp = camp0
-        val st0 = camp0.optString("status", "").uppercase()
-        if (!HW_DONE_STATES.contains(st0) && st0 != "ELIGIBLE") {
-            if (hwTriggerLogin(cookie)) {
+        var loginOk = false
+        if (!hwLoginReportedToday(cookie)) {
+            loginOk = hwTriggerLogin(cookie)
+            if (loginOk) {
+                // 事件刚上报，活动状态可能刚变（尤其 USER_LOGIN 类），重查一次
                 val (c2, _e2) = hwDelivery(cookie)
                 if (c2 != null) camp = c2
             }
         }
+        // 紧接着补 campaign.read（对齐前端 RedDot 的 markRead）：码道的任务型活动
+        // 靠「读过」推进 taskStatus，不发的话 claim 是空操作。
+        val rcid = camp.optInt("campaignId", -1)
+        if (rcid >= 0) hwTriggerRead(cookie, listOf(rcid))
         val cid = camp.optInt("campaignId", -1)
         if (cid < 0) {
             return CheckinResult("huawei", "fail", "每日签到活动缺少 campaignId，无法领取", "")
@@ -2122,15 +2487,34 @@ object LocalCheckin {
         val unitCn = if (unit == "CREDIT") "积分" else unit
         val state = camp.optString("status", "").uppercase()
 
-        if (HW_DONE_STATES.contains(state)) {
+        // 「今天还能不能领」只信 hwClaimed()（对齐码道前端 GPt()），不看裸 status：
+        // status 会一直停在 ELIGIBLE，真正翻的是 claimActions 子项 / taskStatus+claimable。
+        if (hwClaimed(camp)) {
             val held = huaweiHeld(cookie, portalCookie)
             val amtTxt = if (amount > 0) amount.toInt().toString() else "?"
             return CheckinResult("huawei", "already", "今日已签到（$amtTxt $unitCn）", "", held)
         }
-        if (camp.has("claimable") && !camp.optBoolean("claimable", true) &&
-            state.isNotBlank() && state != "ELIGIBLE"
-        ) {
-            return CheckinResult("huawei", "fail", "签到活动当前不可领取（status=$state）", "")
+        if (!hwClaimable(camp)) {
+            // 任务型活动且任务没达成时，claim 是空操作（服务端 200 但什么都不改）。
+            // 这种情形要说清楚「是任务没完成」，不能让用户以为是网络或登录问题。
+            val mode = camp.optString("taskMode", "").uppercase()
+            val tstat = camp.optString("taskStatus", "").uppercase()
+            if (HW_TASK_MODES.contains(mode) && tstat != "COMPLETED") {
+                return CheckinResult(
+                    "huawei", "fail",
+                    "码道的任务还没达成（taskStatus=${tstat.ifBlank { "-" }}，taskMode=$mode，" +
+                        "进度 ${camp.opt("taskCurrent")}/${camp.opt("taskThreshold")}）。" +
+                        "这一项要先在码道客户端或网页里完成任务动作才能领；" +
+                        "软件已经把能做的（登录事件上报）都发了，" +
+                        "若你在客户端里已经做过任务，隔几分钟再试一次", ""
+                )
+            }
+            return CheckinResult(
+                "huawei", "fail",
+                "签到活动当前不可领取（status=${state.ifBlank { "?" }} " +
+                    "taskStatus=${camp.optString("taskStatus", "-")} " +
+                    "claimable=${camp.opt("claimable")}）", ""
+            )
         }
 
         val ts = System.currentTimeMillis()
@@ -2167,11 +2551,10 @@ object LocalCheckin {
                 if (d == null) {
                     return CheckinResult("huawei", "fail", "领取失败（benefitId=$bid）：$e", "", authFailed = af)
                 }
-                val c = d.optInt("code", 0)
-                if (c != 0) {
+                if (!hwRespOk(d)) {
                     return CheckinResult(
                         "huawei", "fail",
-                        "领取失败 code=$c ${d.optString("message", "").take(140)}（benefitId=$bid）", "",
+                        "领取失败 ${hwRespErr(d)}（benefitId=$bid）", "",
                     )
                 }
                 claimed.add(bid)
@@ -2184,11 +2567,10 @@ object LocalCheckin {
                 .toString()
             val (cDoc, cErr, cAf) = hwApi(HW_CLAIM, cookie, "POST", claimBody)
             if (cDoc == null) return CheckinResult("huawei", "fail", "领取失败：$cErr", "", authFailed = cAf)
-            val cCode = cDoc.optInt("code", 0)
-            if (cCode != 0) {
+            if (!hwRespOk(cDoc)) {
                 return CheckinResult(
                     "huawei", "fail",
-                    "领取失败 code=$cCode ${cDoc.optString("message", "").take(140)}", "",
+                    "领取失败 ${hwRespErr(cDoc)}", "",
                 )
             }
         }
@@ -2202,11 +2584,10 @@ object LocalCheckin {
             // 但按协议「少 confirm 不算签完」→ 报 fail 让用户看到，下次自动补确认。
             return CheckinResult("huawei", "fail", "已领取但确认失败（下次会自动补确认）：$fErr", "", authFailed = fAf)
         }
-        val fCode = fDoc.optInt("code", 0)
-        if (fCode != 0) {
+        if (!hwRespOk(fDoc)) {
             return CheckinResult(
                 "huawei", "fail",
-                "签到确认失败 code=$fCode ${fDoc.optString("message", "").take(140)}", "",
+                "签到确认失败 ${hwRespErr(fDoc)}", "",
             )
         }
 
@@ -2217,14 +2598,36 @@ object LocalCheckin {
         // 回读必须按 campaignId 定位同一个活动（hwFindById），不能重新 hwFindDaily：
         // 签完之后原活动变成 CLAIMED，而列表里另一个同类活动（登录礼 / 学生认证）
         // 仍是 ELIGIBLE，重挑就会挑到别人身上，照样报「状态仍是 ELIGIBLE」。
-        val d2 = hwDeliveryAll(cookie)
-        val camp2 = d2.camp
-        val same = hwFindById(d2.all, cid)
-        val state2 = (same?.optString("status", "")
-            ?: camp2?.optString("status", "") ?: "").uppercase()
+        //
+        // v2.53 补两件事（用户 m26306）：
+        // ① 回读**带重试**：码道任务状态是异步结算的，claim/confirm 立刻回读
+        //    经常还是旧值（taskStatus 空、claimable 仍 true）。
+        // ② 重试之间**再补一次 user.login**：前端 a7t() 只在进站发一次，
+        //    我们多发一次是幂等的（idempotentKey 带随机后缀）。
+        var d2 = hwDeliveryAll(cookie)
+        var same = hwFindById(d2.all, cid)
+        var state2 = (same?.optString("status", "")
+            ?: d2.camp?.optString("status", "") ?: "").uppercase()
+        var attempt = 0
+        while (attempt < HW_READBACK_RETRIES) {
+            if (same != null && hwClaimed(same)) break
+            if (same == null && HW_DONE_STATES.contains(state2)) break
+            if (attempt >= HW_READBACK_RETRIES - 1) break
+            kotlinx.coroutines.delay(HW_READBACK_GAP_MS)
+            if (attempt == 0 && !loginOk) hwTriggerLogin(cookie)
+            d2 = hwDeliveryAll(cookie)
+            same = hwFindById(d2.all, cid)
+            state2 = (same?.optString("status", "")
+                ?: d2.camp?.optString("status", "") ?: "").uppercase()
+            attempt++
+        }
         val held = huaweiHeld(cookie, portalCookie)
         val gained = if (amount > 0) "+${amount.toInt()}" else ""
-        if (HW_DONE_STATES.contains(state2)) {
+        // 成功判据同 hwClaimed()：不能只看 status（见 hwClaimed 的注释）。
+        if (same != null && hwClaimed(same)) {
+            return CheckinResult("huawei", "success", "签到成功 $gained$unitCn", gained, held)
+        }
+        if (same == null && HW_DONE_STATES.contains(state2)) {
             return CheckinResult("huawei", "success", "签到成功 $gained$unitCn", gained, held)
         }
         if (d2.err.isNotBlank()) {
@@ -2234,9 +2637,19 @@ object LocalCheckin {
                 authFailed = d2.authFailed,
             )
         }
+        val acts2 = same?.optJSONArray("claimActions")
+        var pending = 0
+        if (acts2 != null) {
+            for (i in 0 until acts2.length()) {
+                val a = acts2.optJSONObject(i) ?: continue
+                if (a.optString("status", "").uppercase() == "ELIGIBLE") pending++
+            }
+        }
         return CheckinResult(
             "huawei", "fail",
-            "领取接口返回成功，但活动状态仍是 ${state2.ifBlank { "未知" }}（未到账）。" +
+            "领取接口返回成功，但活动仍未翻状态（status=${state2.ifBlank { "未知" }}，" +
+                "还有 $pending 个可领子项，taskStatus=${same?.optString("taskStatus", "-") ?: "-"} " +
+                "claimable=${same?.opt("claimable")}）。" +
                 "活动 type=${camp.optString("type", "?")}、campaignId=$cid。" +
                 "若反复出现请把这条发给我",
             "",

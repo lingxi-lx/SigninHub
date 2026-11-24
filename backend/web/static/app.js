@@ -1233,8 +1233,9 @@
       renderTokenHealth();
       loadAutoDiag();
     } else if (name === "prefs") {
-      // 设置页（用户 m15092）：使用说明 / 外观 / 水滴宠物 / 关于
+      // 设置页（用户 m15092）：使用说明 / 后台可靠性 / 外观 / 水滴宠物 / 关于
       renderGuide();
+      renderBgPanel();
       renderThemeGrids();
       renderPetCard();
       renderVersion();
@@ -3769,25 +3770,65 @@
   }
 
   /* ============================================================
-     ⑨ 主题系统：星夜 / 晨雾 / 云朵（纯黑、跟随系统已于 2026-11-20 移除）
+     ⑨ 主题系统：星夜 / 晨雾 / 云朵 / 跟随系统
      ============================================================ */
   const THEMES = [
     { id: "dark",   name: "星夜",   dot: "linear-gradient(135deg,#141a34,#6c8cff)", dark: 1 },
     { id: "light",  name: "晨雾",   dot: "linear-gradient(135deg,#eef3fb,#9db8ff)", dark: 0 },
     { id: "mint",   name: "云朵",   dot: "linear-gradient(135deg,#e9f7f0,#3ec9a0)", dark: 0 },
+    /* 跟随系统不是第四个配色，而是一个「选择模式」：它自己不上 data-theme，
+       实际生效的永远是 dark 或 light。dot 画成上深下浅，一眼看出是跟随。
+       用户 m27113：系统浅色 → 晨雾，系统深色 → 星夜。 */
+    { id: "auto",   name: "跟随系统", dot: "linear-gradient(180deg,#141a34 0%,#141a34 50%,#eef3fb 50%,#eef3fb 100%)", dark: 0, sys: 1 },
   ];
   const THEME_KEY = "signhub_theme";
   const THEME_DEFAULT = "dark";
-  /* 旧版本可能把主题存成 oled / auto（纯黑、跟随系统），这两个已下线，
-     读到就静默回落到星夜，避免出现「没有选中项」或残留的黑底。 */
-  const RETIRED_THEMES = { oled: 1, auto: 1 };
+  /* 旧版本可能把主题存成 oled（纯黑，已下线），读到就静默回落到星夜。
+     注意 auto 已于 2026-11-24 恢复（用户 m27113），不能再列在这里。 */
+  const RETIRED_THEMES = { oled: 1 };
+  /**
+   * 系统当前是不是深色。取不到任何信号时按深色处理（与默认主题一致）。
+   *
+   * **判据优先级（用户 m27260 的真机实测逼出来的）**：
+   *   1. `SignHubApi.sysDark()` —— 安卓侧读原生 `resources.configuration.uiMode`。
+   *      这是唯一可信的：Manifest 声明了 `uiMode`，Activity 自己吃掉 config change，
+   *      WebView 内部那份 Configuration 不会跟着更新，matchMedia 会**一直返回旧值**。
+   *      症状就是「切深色不变星夜、关深色不变晨雾」—— 两个方向都不变。
+   *   2. `matchMedia('(prefers-color-scheme: dark)')` —— 电脑端浏览器与 iOS 走这条。
+   */
+  function sysDark() {
+    try {
+      const api = window.SignHubApi;
+      if (api && typeof api.sysDark === "function") {
+        const v = String(api.sysDark() || "");
+        if (v === "1") return true;
+        if (v === "0") return false;
+      }
+    } catch (_) {}
+    try {
+      return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    } catch (_) {
+      return true;
+    }
+  }
+  /** 把「用户选的主题」解析成「真正要应用的配色 id」。auto → dark / light。 */
+  function resolveThemeId(id) {
+    if (id === "auto") return sysDark() ? "dark" : "light";
+    return THEMES.some((t) => t.id === id) ? id : THEME_DEFAULT;
+  }
   function applyTheme(id) {
     const root = document.documentElement;
-    let t = THEMES.find((x) => x.id === id);
-    if (!t) {
-      t = THEMES.find((x) => x.id === THEME_DEFAULT) || THEMES[0];
-      try { localStorage.setItem(THEME_KEY, t.id); } catch (_) {}
-    }
+    const pick = (id === "auto" || THEMES.some((t) => t.id === id)) ? id : THEME_DEFAULT;
+    const realId = resolveThemeId(pick);
+    const t = THEMES.find((x) => x.id === realId) || THEMES[0];
+    /* 把已下线的旧值（oled）就地改写成回落值，否则 localStorage 里一直躺着
+       一个不存在的 id —— 每次启动都要走一遍回落，且用户看不到「当前选中项」。 */
+    try {
+      const raw = localStorage.getItem(THEME_KEY);
+      if (raw && raw !== pick && !THEMES.some((x) => x.id === raw)) {
+        localStorage.setItem(THEME_KEY, pick);
+      }
+    } catch (_) {}
     root.setAttribute("data-theme", t.id);
     root.classList.toggle("theme-light", !t.dark);
     const metaColor = { dark: "#0a0b10", light: "#eef3fb", mint: "#e9f7f0" };
@@ -3797,9 +3838,9 @@
     try {
       if (window.SignHubApi && window.SignHubApi.setSystemBars) window.SignHubApi.setSystemBars(!t.dark);
     } catch (_) {}
-    $$(".theme-cell").forEach((c) => c.classList.toggle("on", c.dataset.t === t.id));
+    $$(".theme-cell").forEach((c) => c.classList.toggle("on", c.dataset.t === pick));
     const st = $("#themeState");
-    if (st) st.textContent = t.name;
+    if (st) st.textContent = pick === "auto" ? ("跟随系统 · " + t.name) : t.name;
   }
   function setTheme(id) {
     if (RETIRED_THEMES[id]) id = THEME_DEFAULT;
@@ -3809,6 +3850,28 @@
   function currentThemeId() {
     const v = localStorage.getItem(THEME_KEY);
     return (v && THEMES.some((t) => t.id === v)) ? v : THEME_DEFAULT;
+  }
+  /**
+   * 系统深浅色变化时自动重算。
+   *
+   * 为什么需要单独监听：`prefers-color-scheme` 变了不会触发任何 DOM 事件，
+   * 只有 matchMedia 的 change 会。只在当前选的是 auto 时才重绘 —— 用户明确选了
+   * 「星夜」就不该因为系统变亮而被改成晨雾。
+   *
+   * 但**安卓上这条监听基本不会触发**：Manifest 给 WebUiActivity 声明了 `uiMode`，
+   * Activity 自己吃掉 config change，WebView 的媒体查询值不更新、change 也不来。
+   * 真正生效的是原生侧的两处主动推送：`onConfigurationChanged()` 与 `onResume()`
+   * （见 WebUiActivity.kt 的 pushTheme()），它们调 `applyTheme(currentThemeId())`。
+   * 这里保留 matchMedia 监听只为电脑端浏览器与 iOS。
+   */
+  function bindSystemTheme() {
+    try {
+      const mq = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)");
+      if (!mq) return;
+      const onChange = () => { if (currentThemeId() === "auto") applyTheme("auto"); };
+      if (mq.addEventListener) mq.addEventListener("change", onChange);
+      else if (mq.addListener) mq.addListener(onChange);
+    } catch (_) {}
   }
   function themeGridHTML() {
     const cur = currentThemeId();
@@ -3847,9 +3910,49 @@
     const mask = $("#themeMask");
     if (mask) mask.addEventListener("click", (e) => { if (e.target === mask) closeThemeSheet(); });
   }
-  function initTheme() { applyTheme(currentThemeId()); }
+  /**
+   * 把 Android 侧读到的系统栏真实高度写进 CSS 变量 `--inset-t` / `--inset-b`。
+   *
+   * 为什么需要（用户 m26465，华为鸿蒙）：
+   * - 我们开了 edge-to-edge（`setDecorFitsSystemWindows(false)`），内容延伸进状态栏；
+   * - 网页靠 `env(safe-area-inset-top/bottom)` 让出系统栏位置；
+   * - **鸿蒙的 WebView 对这两个 env() 返回 0**，于是顶栏钻进状态栏里（右上齿轮被盖住点不到）、
+   *   底栏被系统手势小横条压住。
+   *
+   * CSS 那边用的是 `max(var(--inset-t), env(safe-area-inset-top))`，
+   * 所以这里写 0 也不会把 Android 原生 WebView 的行为改坏。
+   *
+   * 电脑端没有这个桥（`SignHubApi` 不存在），直接跳过 —— CSS 变量保持 0px。
+   */
+  function syncInsets() {
+    const bridge = window.SignHubApi;
+    if (!bridge || typeof bridge.insets !== "function") return;
+    let info = null;
+    try {
+      info = JSON.parse(bridge.insets() || "{}");
+    } catch (_) {
+      return;
+    }
+    if (!info) return;
+    const top = Number(info.top) || 0;
+    const bottom = Number(info.bottom) || 0;
+    if (top > 0) document.documentElement.style.setProperty("--inset-t", top + "px");
+    if (bottom > 0) document.documentElement.style.setProperty("--inset-b", bottom + "px");
+  }
 
-  /* 齿轮入口（用户 m14411 / m15092）：点它进独立的「设置页」 */
+  /**
+   * 反复对齐系统栏占位：首次调用时 Activity 可能还没拿到 insets（鸿蒙上尤其明显，
+   * 返回 0 之后要等一次布局才有值），旋转屏幕/系统栏显隐也会变。
+   * 只在拿到非 0 值时才写变量，所以多调几次没有副作用。
+   */
+  function syncInsetsRetry() {
+    syncInsets();
+    [120, 400, 900, 1800].forEach((ms) => setTimeout(syncInsets, ms));
+  }
+  window.addEventListener("resize", syncInsets);
+  window.addEventListener("orientationchange", syncInsetsRetry);
+
+  function initTheme() { applyTheme(currentThemeId()); bindSystemTheme(); }  /* 齿轮入口（用户 m14411 / m15092）：点它进独立的「设置页」 */
   function bindGear() {
     const g = $("#gearEntry");
     if (!g) return;
@@ -3931,11 +4034,12 @@
       key: "traesolo",
       title: "Trae Solo",
       rows: [
-        '点<span class="sh-ok">绿色按钮</span>「登录主账号」。',
+        '先去 <b>trae.cn 官网</b>注册账号，并正常登录用一会儿（写几行代码、开一次会话都算）。<b>新号当天注册就拿来签到，很容易被 Trae 记一笔风控</b>。',
+        '回到本软件点<span class="sh-ok">绿色按钮</span>「登录主账号」。',
         '网页里输入手机号，点「获取验证码」，把收到的验证码填进去登录。',
         '登录成功后网页自己关掉，凭据和设备号都会自动填好，卡片上出现<span class="sh-ok">「就绪」</span>就成了。',
-        '这个凭据本身只有 8 小时有效期，但软件会在过期前自动续，<b>不用你管</b>。',
-        '还有第二个号：点<span class="sh-blue">蓝色按钮</span>「多账号管理」→ 再点「＋ 添加账号」→ 重复第 2、3 步。',
+        '怎么判断自己被风控：点「签到」看到红字里有 <b>9074</b> 就是（官网和客户端都不会提示，只有这里能看出来）。等 12~24 小时再试，期间别反复点、也别改设备号。',
+        '还有第二个号：点<span class="sh-blue">蓝色按钮</span>「多账号管理」→ 再点「＋ 添加账号」→ 重复第 2~4 步。',
       ],
     },
     {
@@ -4048,6 +4152,121 @@
 
     const st = $("#guideState");
     if (st) st.textContent = (GUIDE.length - 1) + " 个 AGENT";
+  }
+
+  /**
+   * 「后台可靠性」面板（V2.51）。
+   *
+   * 为什么需要它：定时签到从 WorkManager 换成 AlarmManager 精确闹钟后，
+   * 「准点」这件事第一次真的可能失败 —— 而且是用户完全看不见的那种失败：
+   *   · Android 14+ 全新安装默认不给精确闹钟权限 → 闹钟被推迟几小时
+   *   · AOSP Doze 之外，国产 ROM 的省电策略会连前台服务一起杀
+   *   · 各家「自启动管理」默认关闭第三方应用
+   * 面板把这三项的真实状态摊开，并给出一键跳转，用户不用去系统设置里翻。
+   *
+   * 三项判据都来自原生（Bridge.bgStatus），不是前端猜的。
+   */
+  function renderBgPanel() {
+    const box = $("#bgList");
+    if (!box) return;
+    const bridge = window.SignHubApi;
+
+    // 电脑端 / 浏览器打开时没有原生桥：整块退化成提示，不显示一堆假的「未授权」
+    if (!bridge || typeof bridge.bgStatus !== "function") {
+      box.innerHTML = `<p class="muted small" style="margin:0">电脑端没有这些限制：定时由电脑自己的任务计划保证。这一项只在手机上生效。</p>`;
+      const st0 = $("#bgState");
+      if (st0) st0.textContent = "仅手机端";
+      return;
+    }
+
+    let info = {};
+    try {
+      info = JSON.parse(bridge.bgStatus() || "{}");
+    } catch (_) {
+      info = {};
+    }
+    const sdk = Number(info.sdk || 0);
+    const exactOk = !!info.exact_ok;
+    const batteryOk = !!info.battery_ok;
+    const nextPick = Number(info.next_pick || 0);
+
+    // 精确闹钟：Android 12+ 才有这个概念；更老的系统天然准点，直接算通过
+    const exactNeed = sdk >= 31;
+    const exactPass = !exactNeed || exactOk;
+
+    const rows = [
+      {
+        id: "exact",
+        name: "精确定时",
+        pass: exactPass,
+        on: "已允许 · 息屏也能准点唤醒",
+        off: sdk >= 31 ? "未允许 · 定时会被推迟几小时" : "",
+        btn: exactPass ? "" : "去允许",
+        act: "exact",
+      },
+      {
+        id: "battery",
+        name: "电池优化白名单",
+        pass: batteryOk,
+        on: "已加入 · 后台不会被限制",
+        off: "未加入 · 系统可能提前杀掉签到进程",
+        btn: batteryOk ? "" : "去设置",
+        act: "battery",
+      },
+      {
+        id: "auto",
+        name: "自启动 / 后台运行",
+        pass: null,   // 系统没有可查询的 API，只能给跳转让用户自己确认
+        on: "各家 ROM 默认关闭，建议进去把本应用设为允许",
+        off: "",
+        btn: "去查看",
+        act: "auto",
+      },
+    ];
+
+    box.innerHTML = rows.map((r) => {
+      const dot = r.pass === true ? "ok" : (r.pass === false ? "bad" : "warn");
+      const text = r.pass === true ? r.on : (r.pass === false ? r.off : r.on);
+      return `<div class="bg-row ${dot}">
+        <span class="bg-dot"></span>
+        <div class="bg-main">
+          <div class="bg-name">${escapeHtml(r.name)}</div>
+          <div class="bg-desc">${escapeHtml(text)}</div>
+        </div>
+        ${r.btn ? `<button class="bg-btn" type="button" data-bg="${r.act}">${escapeHtml(r.btn)}</button>` : ""}
+      </div>`;
+    }).join("");
+
+    // 下次排期：让用户能验证「它真的排上了」，而不是只有一个开关
+    if (nextPick > 0) {
+      const d = new Date(nextPick);
+      const pad = (n) => String(n).padStart(2, "0");
+      const when = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      box.insertAdjacentHTML("beforeend",
+        `<p class="muted small" style="margin:10px 0 0">下次自动签到：<b>${when}</b></p>`);
+    } else {
+      box.insertAdjacentHTML("beforeend",
+        `<p class="muted small" style="margin:10px 0 0">还没排期 —— 去「配置 → 每日自动签到」打开开关。</p>`);
+    }
+
+    $$("[data-bg]", box).forEach((b) => {
+      b.addEventListener("click", () => {
+        const act = b.dataset.bg;
+        try {
+          if (act === "exact") bridge.openExactAlarmSettings();
+          else if (act === "battery") bridge.openBatterySettings();
+          else if (act === "auto") bridge.openAutoStartSettings();
+        } catch (e) {
+          toast("打开设置失败：" + e.message, 3000);
+        }
+      });
+    });
+
+    const st = $("#bgState");
+    if (st) {
+      const passN = rows.filter((r) => r.pass === true).length;
+      st.textContent = passN + "/2 已就绪";
+    }
   }
 
   function renderPetCard() {
@@ -4654,8 +4873,9 @@
     document.addEventListener("pointercancel", up, { passive: true });
   }
 
-  window.__signhub = { switchView, loadAll, refreshBalances, renderProviderEditors, renderLogs, renderStats, renderStatsView, feedPet, setTheme, openThemeSheet, renderStack, stackLayout, toggleStack, toast, openAssetMulti, exitAssetMulti };
+  window.__signhub = { switchView, loadAll, refreshBalances, renderProviderEditors, renderLogs, renderStats, renderStatsView, feedPet, setTheme, openThemeSheet, renderStack, stackLayout, toggleStack, toast, openAssetMulti, exitAssetMulti, applyTheme, resolveThemeId, currentThemeId, sysDark };
   initTheme();
+  syncInsetsRetry();
   initRipple();
   initSelPicker();
   initPet();

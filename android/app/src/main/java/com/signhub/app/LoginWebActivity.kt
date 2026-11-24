@@ -428,12 +428,62 @@ class LoginWebActivity : Activity() {
         // 多账号通道必须先清掉这个 WebView 的登录态。
         // 否则网站有「记住登录」：cookie / localStorage 里还是上一个账号，页面一打开就是已登录，
         // 轮询立刻抓到旧凭据 → 直接当成新账号存进列表，用户根本没机会输另一个号。
-        if (toList) {
+        //
+        // Trae 在真正开始登录前先弹一次风控提示（用户 m27966）：
+        // 9074 = ErrWorkRiskControlBanned，最常见诱因是「账号刚在官网注册、还没正常用过，
+        // 就先被本软件拿来签到」。这一步放在主账号与多账号两条入口的公共位置，
+        // 因为两者最终都进到这里（WebUiActivity.openLogin / MultiAccountsActivity.addAccount）。
+        if (provider == P_TRAE) {
+            showTraeRiskNotice {
+                if (toList) {
+                    status.text = "正在清除本站登录状态，准备登录新账号…"
+                    clearWebLoginState { startFlow() }
+                } else {
+                    startFlow()
+                }
+            }
+        } else if (toList) {
             status.text = "正在清除本站登录状态，准备登录新账号…"
             clearWebLoginState { startFlow() }
         } else {
             startFlow()
         }
+    }
+
+    /**
+     * Trae 登录前的风控提示（用户 m27966）。
+     *
+     * 为什么必须弹：9074 是账号级风控封禁，一旦被记，12~24 小时内怎么点都签不上，
+     * 用户会以为是软件坏了。而它的头号诱因是使用顺序 —— 账号在官网刚注册、
+     * 没正常用过就先让脚本签到。把顺序讲在前面，比事后报错解释有用得多。
+     *
+     * 「怎么判断自己被风控」这一条只在本软件里可验证：点签到看到 9074 即是。
+     * Trae 官网/客户端不会给这个提示，所以必须写在这里。
+     */
+    private fun showTraeRiskNotice(onProceed: () -> Unit) {
+        status.text = "先看一条提示：Trae 新号直接签到容易被风控"
+        // 用户 m28007：把「我知道了，继续登录」改成「已阅读，继续登录」，并且换成
+        // **长按确认**（按住时沿边框走进度，未满松手回弹，填满变「已确认」并轻震），
+        // 同时删掉「先不登录」那颗按钮 —— 退出改用安卓返回键（onCancel）。
+        // 少一颗并排按钮后正文和按钮都拿到更宽的空间，不再挤。
+        SignDialog.holdConfirm(
+            this,
+            kicker = "TRAE · 风控提示",
+            title = "先到官网注册，再用本软件签到",
+            message = "Trae 对「刚注册就直接自动签到」的账号查得很严：新号注册当天就签到，" +
+                "很容易被记一笔风控，之后一直报 9074。\n\n" +
+                "怎么算被风控：在本软件点「签到」，红字里出现 9074" +
+                "（ErrWorkRiskControlBanned）就是 —— 官网和客户端都不会提示你，只有这里能看出来。\n\n" +
+                "建议顺序：\n" +
+                "① 先到 trae.cn 官网注册，正常登录用一会儿（写几行代码、开一次会话都算）；\n" +
+                "② 隔几小时（最好隔一天）再用本软件登录签到；\n" +
+                "③ 已经报 9074 的，等 12~24 小时再试，期间别反复点测试、也别改设备号。",
+            holdText = "已阅读，继续登录",
+            holdHint = "长按不放 · 填满边框即确认",
+            confirmedText = "已确认",
+            onOk = onProceed,
+            onCancel = { finish() },
+        )
     }
 
     /** 按 provider 打开对应的登录流程（清登录态之后再调用） */

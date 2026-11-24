@@ -11,7 +11,7 @@
 <link rel="apple-touch-icon" href="/static/icon-180.png" />
 <link rel="icon" href="/static/icon-192.png" />
 <title>签到中心</title>
-<link rel="stylesheet" href="/static/app.css?v=249" />
+<link rel="stylesheet" href="/static/app.css?v=261" />
 </head>
 <body>
   <div class="reveal-mask" id="revealMask"><span></span></div>
@@ -471,7 +471,7 @@
         <div class="hero-head">
           <p class="hero-kicker">PREFERENCES</p>
           <h1 class="hero-title">设置</h1>
-          <p class="hero-sub">外观 · 说明 · 宠物 · 关于</p>
+          <p class="hero-sub">外观 · 后台 · 说明 · 宠物 · 关于</p>
         </div>
       </section>
 
@@ -483,6 +483,16 @@
           </div>
           <p class="muted small">每个 AGENT 的登录方式与签到原理。配置页只放字段，说明都在这里。</p>
           <div id="guideList"></div>
+        </section>
+
+        <section class="panel" id="bgPanel">
+          <div class="panel-head">
+            <h2>后台可靠性</h2>
+            <span class="muted small" id="bgState"></span>
+          </div>
+          <p class="muted small">这三项决定「息屏后能不能准点签到」。系统不给权限时，定时会被推迟到几小时后，甚至当天不跑。</p>
+          <div id="bgList"></div>
+          <p class="muted small" style="margin:10px 0 0">已改为系统级精确定时（AlarmManager），不再依赖 WorkManager 的延迟队列，Doze 状态下也能准点唤醒。</p>
         </section>
 
         <section class="panel">
@@ -544,6 +554,6 @@
   </div>
   <div id="petFloatBtn" hidden></div>
   <canvas id="confettiCv"></canvas>
-  <script src="/static/app.js?v=249"></script>
+  <script src="/static/app.js?v=261"></script>
 </body>
 </html>

@@ -1,6 +1,7 @@
 package com.signhub.app
 
 import android.content.Context
+import android.os.Build
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
@@ -1541,7 +1542,7 @@ class LocalApi(private val ctx: Context) {
                 val ok = hwUsable(ck)
                 put("reachable", ok)
                 put("auth_ok", ok)
-                put("has_cftk", ck.contains("devclouddevuibtcftk="))
+                put("has_cftk", LocalCheckin.hwHasCftk(ck))
                 put("accounts", accs.size)
                 // 积分接口与签到同域（/chat/snap-manager/v1/statistics/plugin），
                 // 用同一份 cookie —— 会话可用即积分可读。
@@ -1552,8 +1553,8 @@ class LocalApi(private val ctx: Context) {
                     // 早先这里一律说「缺少会话 Cookie」，用户拿着「我明明填了」去看诊断会被带偏。
                     if (accs.isEmpty()) put("缺少华为会话 Cookie：点「登录华为码道」在站内登录一次即可自动采集")
                     else if (!ok) put("这份 Cookie 是未登录状态（华为对未登录访客也发匿名会话）：请重新登录一次")
-                    else if (!ck.contains("devclouddevuibtcftk="))
-                        put("Cookie 里没有 devclouddevuibtcftk（CSRF 令牌），领取会被拒 —— 建议重新登录一次")
+                    else if (!LocalCheckin.hwHasCftk(ck))
+                        put("Cookie 里没有 CSRF 令牌（cftk），领取会被拒 —— 请重新登录一次完整采集")
                 })
             }
             else -> JSONObject().put("ok", false).put("error", "未知服务")
@@ -2421,33 +2422,25 @@ class LocalApi(private val ctx: Context) {
             o.put("last_body", last["body"] as String)
         }
 
-        // 下次排期：把 WorkManager 里那条任务的剩余延迟读出来
-        try {
-            val wm = androidx.work.WorkManager.getInstance(ctx)
-            // N4（BUGS-v2.1）：.get() 无超时，WorkManager 的 binder 调用在极端情况
-            // （DB 锁 / 系统繁忙）会一直卡住，把整个 /api/auto_status 拖死。
-            // 2 秒拿不到就当作「读不到排期」，不影响主流程。
-            val infos = wm.getWorkInfosForUniqueWork(AutoCheckinScheduler.WORK_NAME)
-                .get(2, java.util.concurrent.TimeUnit.SECONDS)
-            val live = infos.firstOrNull {
-                it.state == androidx.work.WorkInfo.State.ENQUEUED ||
-                    it.state == androidx.work.WorkInfo.State.RUNNING ||
-                    it.state == androidx.work.WorkInfo.State.BLOCKED
-            }
-            if (live != null) {
-                o.put("queued", true)
-                o.put("queued_state", live.state.name)
-                o.put("queued_attempts", live.runAttemptCount)
-            } else {
-                o.put("queued", false)
-                val lastInfo = infos.firstOrNull()
-                o.put("queued_state", lastInfo?.state?.name ?: "NONE")
-                o.put("queued_attempts", lastInfo?.runAttemptCount ?: 0)
-            }
-        } catch (e: Exception) {
-            o.put("queued", false)
-            o.put("queued_state", "ERR:" + (e.message ?: "").take(60))
-        }
+        // 下次排期（V2.51）：主调度是 AlarmManager 精确闹钟，时刻持久化在 LocalConfig.nextPick。
+        //
+        // 为什么不再读 WorkManager：定时签到已经从 WorkManager 迁到 AlarmManager。
+        // WorkManager 现在只负责「立即签到」，拿它的 workInfo 报「下次自动签到」会一直
+        // 显示 NONE / 上一次的残留状态，等于给用户一个假的诊断面板。
+        val nextPick = AutoCheckinScheduler.nextPickAt(ctx)
+        o.put("next_pick", nextPick)
+        o.put("next_pick_at", if (nextPick > 0) {
+            java.time.Instant.ofEpochMilli(nextPick)
+                .atZone(java.time.ZoneId.of("Asia/Shanghai"))
+                .format(java.time.format.DateTimeFormatter.ofPattern("MM-dd HH:mm"))
+        } else "")
+        o.put("queued", nextPick > System.currentTimeMillis())
+        o.put("queued_state", if (nextPick > 0) "ALARM" else "NONE")
+
+        // 精确定时授权状态：Android 14+ 全新安装默认不给，没有它闹钟会被推迟数小时。
+        // 这是「到点没签」最常见的原因，必须让用户看得见。
+        o.put("exact_ok", AutoCheckinScheduler.canExact(ctx))
+        o.put("sdk", Build.VERSION.SDK_INT)
 
         // 就绪情况：这三项任一为空，那次自动签到的结果必然是「未执行」
         o.put("wb_ready", s.wbToken.isNotBlank() || runCatching {
@@ -2833,6 +2826,21 @@ data class LocalConfig(
     val schedulerTime: String = "08:30",
     /** 随机浮动上限（分钟，0~240）：实际执行 = 目标时间 + random(0..jitter)。0 表示不加浮动。 */
     val schedulerJitter: Int = 30,
+    /**
+     * 已排定的下次执行时刻（毫秒，0 = 未排）。
+     *
+     * V2.51 引入：换成 AlarmManager 精确闹钟后，「已排时刻」不能再靠 WorkManager 的
+     * 数据库查（闹钟是系统级记录）。持久化它是为了两件事：
+     *   ① 开机 / 打开 App 时如果这个时刻还在未来，就原样重排，不重新抽
+     *      —— 否则用户上午打开一次 App，今天 08:30 那次就被顶成明天
+     *   ② 设置页可以显示「下次自动签到：MM-dd HH:mm」而不必去问系统
+     */
+    val nextPick: Long = 0L,
+    /**
+     * 网络类失败后的补签时刻（毫秒，0 = 没有补签）。
+     * 同一天只补一次，避免上游持续故障时每 10 分钟打一遍。
+     */
+    val retryAt: Long = 0L,
 ) {
     companion object {
         private const val PREF = "local_config"
@@ -2842,6 +2850,8 @@ data class LocalConfig(
                 schedulerEnabled = p.getBoolean("enabled", true),
                 schedulerTime = p.getString("time", "08:30") ?: "08:30",
                 schedulerJitter = p.getInt("jitter", 30).coerceIn(0, 240),
+                nextPick = p.getLong("next_pick", 0L),
+                retryAt = p.getLong("retry_at", 0L),
             )
         }
 
@@ -2850,6 +2860,8 @@ data class LocalConfig(
                 .putBoolean("enabled", c.schedulerEnabled)
                 .putString("time", c.schedulerTime)
                 .putInt("jitter", c.schedulerJitter.coerceIn(0, 240))
+                .putLong("next_pick", c.nextPick)
+                .putLong("retry_at", c.retryAt)
                 .apply()
         }
     }

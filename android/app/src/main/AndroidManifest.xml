@@ -7,6 +7,16 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <!-- 「后台可靠性」面板要能直接跳到系统设置页；不声明则 startActivity 静默失败 -->
+        <intent>
+            <action android:name="android.settings.APPLICATION_DETAILS_SETTINGS" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+        </intent>
+        <intent>
+            <action android:name="android.settings.REQUEST_SCHEDULE_EXACT_ALARM" />
+        </intent>
     </queries>
 
     <uses-permission android:name="android.permission.INTERNET" />
@@ -14,6 +24,33 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 长按确认按钮填满后的一次轻震（V2.60）。普通权限，安装即授予。
+         不用 performHapticFeedback 是因为它受「触摸振动」系统开关控制，关掉就完全没反馈。 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- ── 精确定时（V2.51）──────────────────────────────────────────────
+         SCHEDULE_EXACT_ALARM（API 31）：
+           Android 12/13 默认授予、用户可随时在「特殊应用权限」里撤销；
+           Android 14+ **全新安装默认不授予**，必须引导用户手动开。
+         USE_EXACT_ALARM（API 33）：
+           安装即授予、用户不可撤销 —— 但这是 Google Play 的受限权限，
+           只批给「闹钟 / 日历 / 计时器」这类以精确定时为核心功能的应用。
+           我们是侧载分发（不上 Play），所以可以声明；若将来上架会被拒审。
+         两者同时声明：API 33+ 走 USE_EXACT_ALARM 免授权，API 31/32 走
+         SCHEDULE_EXACT_ALARM（默认已授予），更老的版本无需该权限。
+    -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+
+    <!-- ── 前台服务（V2.51）──────────────────────────────────────────────
+         精确闹钟的广播接收器只有约 10 秒存活，装不下五家平台十几个账号的网络请求，
+         必须交给前台服务承接。dataSync 类型对应「短时数据同步」，是这里最贴切的分类。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- 引导用户把本应用加入电池优化白名单（国产 ROM 的进程杀手不认这个，
+         但 AOSP 的 Doze 会认；有比没有好） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- allowBackup 必须为 false：DataStore 里存着 WorkBuddy / Trae / Qoder / MiniMax 凭据，
          一旦允许备份，adb backup 或云备份就能把 token 整包拖走。
@@ -32,11 +69,17 @@
         android:theme="@style/Theme.SigninHub">
 
         <!-- 主界面：WebView 加载内置网页版（与 PWA 同一套 UI） -->
+        <!--
+          configChanges 里带 uiMode（2026-11-24 加）：
+          「跟随系统」主题需要响应系统深浅色切换。不声明 uiMode 时系统会重建 Activity，
+          WebView 整个重载（约 1 秒白屏、滚动位置全丢）；声明后走 onConfigurationChanged，
+          由 WebUiActivity 直接让网页重算主题，体感是瞬间切换。
+        -->
         <activity
             android:name=".WebUiActivity"
             android:exported="true"
             android:label="@string/app_name"
-            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize">
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -87,6 +130,26 @@
         <receiver
             android:name=".ReminderReceiver"
             android:exported="false" />
+
+        <!-- 精确闹钟广播 → 拉起签到前台服务（V2.51）。
+             必须 exported=false + 显式 Intent（见 AutoCheckinScheduler.alarmIntent）：
+             显式 Intent 不受 exported 限制，而 exported=true 会让任意应用伪造闹钟触发签到。 -->
+        <receiver
+            android:name=".AutoCheckinAlarmReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.signhub.app.action.CHECKIN_ALARM" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 定时签到执行体（前台服务）。
+             exported=false：只允许本应用启动。
+             foregroundServiceType=dataSync：Android 14 起不声明类型会抛
+             MissingForegroundServiceTypeException。 -->
+        <service
+            android:name=".AutoCheckinService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <receiver
             android:name=".BootReceiver"

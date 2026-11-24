@@ -11,8 +11,8 @@ android {
         applicationId = "com.signhub.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 249
-        versionName = "2.49"
+        versionCode = 261
+        versionName = "2.61"
     }
 
     buildFeatures {

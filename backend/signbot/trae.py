@@ -446,15 +446,14 @@ def run(cfg=None):
         if code not in (0, None) and code not in ALREADY_CODES:
             msg = str(doc.get("message") or doc.get("msg") or "")[:160]
             if code in DEVICE_CODES:
-                hint = ("（设备校验未通过 code=9074：已按桌面端真机口径发齐 7 个头"
-                        "（x-device-brand=机型码 / x-device-type=windows / "
-                        "x-os-version=系统版本名 / x-app-version=1.107.1），"
-                        "req_source=1 与 2 两种口径也都试过了，仍被拒说明设备号 "
-                        f"{device_id} 在该账号下没有注册记录 —— 它是按凭据算出来的，"
-                        "不是任何一台真机的号。两条出路：① 用该账号登录一次 Trae 桌面客户端，"
-                        "再点「读取本机凭据」带出真机号；② 手动填它 storage.json 里 "
-                        "iCubeAuthInfo://icube-dc: 后面那 16 位数字。"
-                        "一个真机号一天只能签一个账号，多账号请各用各的号）")
+                hint = ("（被 Trae 风控拦了 code=9074 = ErrWorkRiskControlBanned，"
+                        "不是「设备没注册」—— 那是 9095）。上游文案「当前参与用户太多」是套话，"
+                        "等几分钟没用。头号诱因是使用顺序：账号在官网刚注册、还没正常用过，"
+                        "就先被本软件拿来签到。建议：① 先到 trae.cn 官网正常登录用一会儿"
+                        "（写几行代码、开一次会话都算），隔几小时（最好隔一天）再回来签；"
+                        "② 已经报 9074 的，等 12~24 小时再试；"
+                        f"③ 期间不要改设备号（当前 {device_id}）、也不要反复点测试"
+                        "（每次调用都会被记一次））")
             elif code in AUTH_HARD_CODES:
                 hint = _auth_hint(code)
             else:
@@ -502,9 +501,11 @@ def run(cfg=None):
         code2 = doc2.get("code")
         if code2 not in (0, None) and code2 not in ALREADY_CODES and doc2.get("checked_in") is not True:
             if code2 in DEVICE_CODES:
-                hint = ("（设备校验未通过 code=9074：7 个头已按真机口径发齐、req_source=1/2 都试过，"
-                        "仍失败说明该设备号在该账号下没有注册记录 —— "
-                        "需换该账号自己注册过的真实机器号；一个真实机器号一天只能签一个账号）")
+                hint = ("（被 Trae 风控拦了 code=9074 = ErrWorkRiskControlBanned，"
+                        "不是「设备没注册」—— 那是 9095）。头号诱因是使用顺序：账号在官网"
+                        "刚注册、还没正常用过就先来签到。建议：① 先到 trae.cn 官网正常用一会儿，"
+                        "隔几小时（最好隔一天）再回来签；② 已经报 9074 的等 12~24 小时；"
+                        f"③ 期间不要改设备号（当前 {device_id}）、也不要反复点测试）")
             elif code2 in AUTH_HARD_CODES:
                 hint = _auth_hint(code2)
             else:

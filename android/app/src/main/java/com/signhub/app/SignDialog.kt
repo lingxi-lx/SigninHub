@@ -105,6 +105,13 @@ object SignDialog {
         okText: String = "确定",
         cancelText: String = "取消",
         danger: Boolean = false,
+        // 默认 null = 只关窗（原有行为不变）。需要「取消也要做事」的场景（例如登录前的
+        // 风控提示，用户选了「先不登录」就得把 Activity 收掉）才传。
+        //
+        // 必须排在 onOk **之前**：调用方大量使用尾随 lambda（`confirm(...) { ... }`），
+        // 尾随 lambda 绑的是最后一个参数。把它放最后会让所有老调用点的 lambda 变成
+        // onCancel，报 `No value passed for parameter 'onOk'`。
+        onCancel: (() -> Unit)? = null,
         onOk: () -> Unit,
     ) {
         val dlg = base(activity)
@@ -118,7 +125,10 @@ object SignDialog {
             setPadding(dp(activity, 20), dp(activity, 2), dp(activity, 20), dp(activity, 8))
         })
         footer(activity, card) {
-            ghost(activity, cancelText) { dlg.dismiss() }
+            ghost(activity, cancelText) {
+                dlg.dismiss()
+                onCancel?.invoke()
+            }
             primary(
                 activity,
                 okText,
@@ -127,6 +137,66 @@ object SignDialog {
                 dlg.dismiss()
                 onOk()
             }
+        }
+        finish(activity, dlg, card)
+    }
+
+    // ────────────────────────── 长按确认 ──────────────────────────
+
+    /**
+     * 只有一个「长按确认」按钮的弹窗（用户 m28007）。
+     *
+     * 与 [confirm] 的差别不只是少一颗按钮：
+     *   · 没有「取消」—— 退出走**安卓返回键**（[Dialog.setOnCancelListener]），
+     *     少一个并排按钮，正文和按钮都能拿到更宽的空间；
+     *   · 主按钮通栏 + 52dp 高，按住时边框走进度（[HoldConfirmButton]），
+     *     填满才回调，避免「没看完就顺手点掉」。
+     *
+     * `onCancel` 在返回键退出时触发（调用方通常在里面 `finish()` 掉整个页面）；
+     * 点窗外不会关闭 —— 这个弹窗的语义是「必须先表态」。
+     */
+    fun holdConfirm(
+        activity: Activity,
+        kicker: String?,
+        title: String,
+        message: String,
+        holdText: String,
+        holdHint: String = "长按不放，填满边框即确认",
+        confirmedText: String = "已确认",
+        onCancel: (() -> Unit)? = null,
+        onOk: () -> Unit,
+    ) {
+        val dlg = base(activity)
+        dlg.setCanceledOnTouchOutside(false)
+        val card = card(activity)
+        header(activity, card, kicker, title, null)
+        card.addView(TextView(activity).apply {
+            text = message
+            setTextColor(MUTED)
+            textSize = 13.5f
+            setLineSpacing(dp(activity, 4).toFloat(), 1.38f)
+            setPadding(dp(activity, 20), dp(activity, 4), dp(activity, 20), dp(activity, 18))
+        })
+
+        val bar = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(activity, 18), dp(activity, 2), dp(activity, 18), dp(activity, 18))
+        }
+        val btn = HoldConfirmButton(activity).apply {
+            label = holdText
+            subLabel = holdHint
+            this.confirmedLabel = confirmedText
+            onConfirmed = {
+                dlg.dismiss()
+                onOk()
+            }
+        }
+        bar.addView(btn, LinearLayout.LayoutParams(MATCH, dp(activity, 58)))
+        card.addView(bar)
+
+        dlg.setOnCancelListener {
+            dlg.dismiss()
+            onCancel?.invoke()
         }
         finish(activity, dlg, card)
     }
@@ -341,12 +411,29 @@ object SignDialog {
         card.addView(bar)
     }
 
-    private fun ghost(activity: Activity, text: String, onClick: () -> Unit): View =
-        pill(activity, text, listOf(Color.parseColor("#20273A"), Color.parseColor("#20273A")),
-            textColor = MUTED, stroke = LINE, onClick = onClick)
+    /**
+     * 次按钮 / 主按钮。
+     *
+     * **必须是 `LinearLayout` 的扩展函数，内部自己 `addView`** —— 早期版本写成
+     * `fun ghost(...): View = pill(...)`，`footer { bar.build() }` 里调完就把返回值丢了，
+     * 于是每个弹窗的按钮栏都是空的：确认框只剩标题和正文，用户找不到「删除/确定」
+     * （用户 m26250 报的就是这个，截图里那两颗按钮其实是背后账号卡片透出来的）。
+     */
+    private fun LinearLayout.ghost(activity: Activity, text: String, onClick: () -> Unit) {
+        addView(
+            pill(activity, text, listOf(Color.parseColor("#20273A"), Color.parseColor("#20273A")),
+                textColor = MUTED, stroke = LINE, onClick = onClick)
+        )
+    }
 
-    private fun primary(activity: Activity, text: String, colors: List<Int>, onClick: () -> Unit): View =
-        pill(activity, text, colors, textColor = Color.WHITE, stroke = 0, onClick = onClick)
+    private fun LinearLayout.primary(
+        activity: Activity,
+        text: String,
+        colors: List<Int>,
+        onClick: () -> Unit,
+    ) {
+        addView(pill(activity, text, colors, textColor = Color.WHITE, stroke = 0, onClick = onClick))
+    }
 
     private fun pill(
         activity: Activity,

@@ -36,7 +36,8 @@
                 "x-codearts-doer-scenario-type":"web"};
     function lo(){ return {...xs, "Agent-Type":"PromptCenter", "X-Language": t}; }
 
-其中 `cftk` 头是 CSRF 令牌，取值来自 cookie `devclouddevuibtcftk`。
+其中 `cftk` 头是 CSRF 令牌，取值来自 cookie `devclouddevuibjtcftk`
+（名字逐字来自首页 HTML 的 `window['cftk_cookie_key_cf2']`，且值要 URL 解码）。
 
 ## 会话短效
 
@@ -56,6 +57,7 @@ import random
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime
 
@@ -113,29 +115,81 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # 只认复数写法时，如果服务端返单数，我们永远判不出「已签」，
 # 症状就是「明明签了，软件还显示签到入口」。
 DONE_STATES = ("CLAIMED", "CONFIRMED", "CONSUMED", "CONFIRM", "CONSUME")
-# 每日签到活动的 type。前端 w_() 同时认大写与 snake 写法，default 也归到 daily_claim。
+# 活动已结束（卖完 / 窗口关闭）—— 竞答类活动的终态，见 `_claimed()`。
+ENDED_STATES = ("SOLD_OUT", "WINDOW_ENDED")
+# 任务型活动（要做任务才可领）的 taskMode 取值。
+TASK_MODES = ("CONTINUOUS", "NON_CONTINUOUS")
+# 每日签到活动的 type。前端 `w_()` 同时认大写与 snake 写法，default 也归到 daily_claim。
 #
-# ⚠️ `USER_LOGIN` 必须与 `DAILY_CLAIM` **分开**（v2.42 修的事故）：
-# delivery 列表里「新用户登录即送 4000 积分」(USER_LOGIN) 与「每日签到领 100 积分」
-# (DAILY_CLAIM) 是两条同时存在的活动。老代码把两者塞进同一个池子、谁先 ELIGIBLE
-# 就返回谁 → 领的是登录礼，每日签到一动没动，回读自然还是 ELIGIBLE，
-# 于是报出「领取接口返回成功，但活动状态仍是 ELIGIBLE」这种假失败（m23825 截图）。
-DAILY_TYPES = ("DAILY_CLAIM", "DAILY_CHECKIN", "DAILY_CHECK_IN", "DAILY_SIGN_IN")
-# 登录礼类活动：只在没有任何每日签到活动时才退而求其次（例如新号首日）。
-LOGIN_TYPES = ("USER_LOGIN", "USER_LOGIN_DAILY")
+# ⚠️ **`USER_LOGIN` 就是「每日签到领积分」本身**（v2.50 纠正 v2.42 的误判）。
+# 用户 m25808 的实机红字是 `type=USER_LOGIN、campaignId=34`，而码道客户端里
+# 这一项的名字正是「每日签到领 10…积分」。v2.42 时我把它当成「新用户登录礼」
+# 并刻意降低优先级 —— 那个结论来自营销文案 `loginPromptText`（「新用户登录即送
+# 4000 积分，每日签到可领取 1000 积分」）的猜测，不是证据。华为是把「登录」
+# 当成签到任务的动作来登记活动的，type 叫什么与「能不能天天领」无关。
+DAILY_TYPES = ("DAILY_CLAIM", "DAILY_CHECKIN", "DAILY_CHECK_IN", "DAILY_SIGN_IN",
+               "USER_LOGIN", "USER_LOGIN_DAILY")
 # 单次 run 里最多领几个 benefit（防止 claimActions 异常长时打爆上游）
 MAX_BENEFITS = 6
+# confirm 之后回读状态的重试次数与间隔。
+#
+# 码道的任务状态是**异步结算**的：claim + confirm 立刻回读，经常还是旧值
+# （用户 m26306 的红字就是 `status=ELIGIBLE taskStatus=- claimable=true`）。
+# 隔 1.5 秒重查两三次命中率明显不同，代价是失败时多花 3 秒。
+READBACK_RETRIES = 3
+READBACK_GAP_SEC = 1.5
 
 # 事件上报端点。码道前端进站第一件事就是 `o7t()`：
 #   `POST /ops/events/trigger {triggerEvent:"user.login", channel:"WEB", idempotentKey:"login-<ymd>-<rand>"}`
 # 用 localStorage["lastLoginReportDate"] 保证一天只报一次。
 # 服务端靠这个事件把 `USER_LOGIN` 类活动的 `status` 从「不存在」推到 `ELIGIBLE`
 # —— 我们从来不发，所以这类活动在我们眼里可能一直不可领（或领了不翻状态）。
-EVENTS_PATH = "/ops/events/trigger"
+# ⚠️ 路径必须以 `/v1` 开头 —— `HW_BASE` 只到 `.../chat/PromptCenterService`，
+# 而前端 `so = "/PromptCenterService/v1"`。v2.53 漏了这个前缀，
+# 导致电脑端的 `user.login` 与 `tasks/conversation` 一直打到不存在的路由
+# （华为对未匹配路由回 200 空体，`_api` 报「空响应」，被当成「任务进度拿不到」静默跳过）。
+EVENTS_PATH = "/v1/ops/events/trigger"
 LOGIN_EVENT = "user.login"
 
+# 任务进度端点。码道前端的 `taskMode` / `taskStatus` / `taskCurrent` /
+# `taskThreshold` / `benefitStatus` **不在 delivery 里**，而是从
+#   `GET /ops/tasks/conversation?channel=WEB`
+# 单独取回，再在 `p_` 里按 `campaignId` 合并进活动对象：
+#
+#   const p_ = computed(() => u.value.map(I => {
+#     const F = y_(I), j = p.value[F.id];
+#     return j && (F.taskCurrent = j.current, F.taskThreshold = j.threshold,
+#                  F.taskMode = j.mode, F.taskBenefitStatus = j.benefitStatus,
+#                  F.taskNeedRemindToday = j.needRemindToday,
+#                  F.taskStatus = j.taskStatus), F
+#   }));
+#
+# 这是 v2.53 修的第三个根因（用户 m26306）：我们只读 delivery，所以
+# `taskStatus` 永远是空，`_claimed()` 的任务型分支永远判不出「已签」，
+# 症状就是「领取接口返回成功，但活动仍未翻状态（taskStatus=-）」。
+TASKS_PATH = "/v1/ops/tasks/conversation"
+
 SESSION_COOKIE_NAMES = ("devclouddevuibjJ_SESSION_ID", "J_SESSION_ID")
-CFTK_COOKIE = "devclouddevuibtcftk"
+
+# CSRF 令牌的 cookie 名 —— 必须逐字对齐首页 HTML 里硬写的那个：
+#
+#   window['cftk_cookie_key_cf2'] = 'devclouddevuibjtcftk';
+#
+# ⚠️ 这里曾经写成 `devclouddevuibtcftk`（**少一个 `j`**），于是 `_cftk()`
+# 永远取不到值、`cftk` 头恒为空，服务端直接回 `csrf validate fail.`
+# —— 用户 m27543 截图里那条红字就是这么来的。
+# 这个 cookie 名与 `devclouddevuibjJ_SESSION_ID` 同前缀（`devclouddevuibj`），
+# 少写一个字母肉眼极难发现，所以下面留了候选表做兜底。
+CFTK_COOKIE = "devclouddevuibjtcftk"
+
+# 兜底候选：按顺序找，第一个非空的胜出。
+# 华为在不同部署（hws / clouddragon / 海外站）用过不同前缀，
+# 与其再猜一次，不如把已知写法都试一遍。
+CFTK_COOKIE_CANDIDATES = (
+    "devclouddevuibjtcftk",   # 当前 hws 站点（首页 HTML 硬写）
+    "devclouddevuibtcftk",    # v2.57 及之前写错的那个（某些老部署可能真用这个）
+    "cftk",                   # window.app_cookie_prefix 的裸值
+)
 
 
 # ─────────────────────────── 凭据 ───────────────────────────
@@ -184,11 +238,40 @@ def has_portal_session(cookie: str) -> bool:
 
 
 def _cftk(cookie: str) -> str:
-    """从 cookie 串里取 CSRF 令牌（`cftk` 头的值）。"""
+    """从 cookie 串里取 CSRF 令牌（`cftk` 头的值）。
+
+    两条都必须照抄前端，否则服务端回 `csrf validate fail.`：
+
+    1. **cookie 名逐字对齐** —— 前端 `tae.getItem(t)` 是按名精确比对的，
+       首页 HTML 写的是 `devclouddevuibjtcftk`（注意 `devclouddevuibj` 这个
+       前缀，少一个字母就永远取不到）。
+    2. **值要 `decodeURIComponent`** —— 前端写 cookie 时 `encodeURIComponent`，
+       读回来时 `decodeURIComponent`。cftk 里常含 `%2B`（`+`）、`%2F`（`/`）
+       这类字符，不解码就发出去等于发了个错令牌。
+
+    取不到时返回空串，调用方（`_headers`）会跳过 `cftk` 头 ——
+    服务端于是回 `csrf validate fail.`，这是唯一能让人一眼定位的症状。
+    """
+    if not cookie:
+        return ""
+    pairs = {}
     for part in cookie.split(";"):
         part = part.strip()
-        if part.startswith(CFTK_COOKIE + "="):
-            return part.split("=", 1)[1].strip()
+        if not part or "=" not in part:
+            continue
+        name, val = part.split("=", 1)
+        pairs[name.strip()] = val.strip()
+    for name in CFTK_COOKIE_CANDIDATES:
+        raw = pairs.get(name) or ""
+        if not raw:
+            continue
+        # 前端：decodeURIComponent(r[1])，解码失败时原样返回（见 tae.getItem）
+        try:
+            out = urllib.parse.unquote(raw)
+        except Exception:
+            out = raw
+        if out:
+            return out
     return ""
 
 
@@ -306,29 +389,146 @@ def _api(path: str, cookie: str, method: str = "GET", body=None, proxy: str = ""
         return None, ("华为接口返回的不是 JSON（HTTP %d）：头组不完整或登录态失效。响应前 80 字符：%s"
                       % (status, text[:80].replace("\n", " ")))
     try:
-        return json.loads(text), ""
+        doc = json.loads(text)
     except Exception as e:
         return None, "华为接口返回的 JSON 解析失败: %s（前 80 字符：%s）" % (
             e, text[:80].replace("\n", " "))
+    # CSRF 失败是最容易误判的一种：HTTP 200、JSON 合法、只有一句英文。
+    # 单看它像「业务失败」，实际是「我们没把 cftk 头带对」—— 翻译成人话，
+    # 否则用户只会看到 `csrf validate fail.` 然后以为是华为封号了。
+    if isinstance(doc, dict) and "csrf" in str(doc.get("error") or doc.get("message") or "").lower():
+        tk = _cftk(cookie)
+        if not tk:
+            return None, ("CSRF 令牌没取到（`csrf validate fail.`）：采集到的 Cookie 里没有 %s。"
+                          "华为把 CSRF 令牌放在这个 cookie 里，缺它任何写操作都会被拒。"
+                          "请重新「登录华为码道」采集一次；若反复出现请把这条发给我"
+                          % CFTK_COOKIE)
+        return None, ("CSRF 校验失败（`csrf validate fail.`）：Cookie 里的 %s 已失效或与会话不匹配。"
+                      "华为的 CSRF 令牌跟会话一起过期，请重新「登录华为码道」采集一次"
+                      % CFTK_COOKIE)
+    return doc, ""
+
+
+def _resp_ok(doc) -> bool:
+    """这个响应算不算成功 —— 逐字对齐码道前端的 `$s()`（v2.54 修正）。
+
+    ```js
+    function $s(e){
+      return e.code===0 || e.code===200 || (e.data!==undefined && e.data!==null)
+        ? {success:!0, data:e.data}
+        : {success:!1, error:e.message||("error_code="+e.code), code:e.code};
+    }
+    ```
+
+    ⚠️ v2.53 及之前判的是 `doc.get("code") not in (0, None)` ——
+    也就是**响应里没有 `code` 字段就一律当成功**。码道业务失败时经常返回
+    `{"success": false, "error": "..."}` 这种没有 `code` 的形状，
+    于是我们把「领取失败」当成「领取成功」，接着去 confirm、去回读，
+    状态当然一动不动，最后报出一句「领取接口返回成功，但活动仍未翻状态」。
+    这正是用户 m26896 截图里那条文案的来历。
+
+    现在三条都要求：`code` 显式为 0 / 200，或者 `data` 非空；
+    `success is False` 直接判失败（比前端更严，因为我们要据此决定是否写今日标记）。
+    """
+    if not isinstance(doc, dict):
+        return False
+    if doc.get("success") is False:
+        return False
+    code = doc.get("code")
+    if code == 0 or code == 200:
+        return True
+    if code is None:
+        # 没有 code：只有 data 非空才算成功（与前端一致）
+        return doc.get("data") is not None
+    return False
+
+
+def _resp_err(doc) -> str:
+    """把失败响应压成一句给人看的原因。"""
+    if not isinstance(doc, dict):
+        return "响应不是对象"
+    code = doc.get("code")
+    msg = doc.get("message") or doc.get("msg") or ""
+    if not msg:
+        err = doc.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("code") or ""
+        elif isinstance(err, str):
+            msg = err
+    msg = str(msg)[:140]
+    if code is None:
+        return msg or "业务失败（响应没有 code 字段）"
+    return "code=%s %s" % (code, msg) if msg else "code=%s" % code
 
 
 # ─────────────────────────── 活动 ───────────────────────────
 
+def _claimed(camp) -> bool:
+    """这个活动**还能不能领**？—— 逐字对齐码道前端 `GPt()`。
+
+    ```js
+    const ELIGIBLE="ELIGIBLE", DONE=["CLAIMED","CONFIRMED","CONSUMED"], ENDED=["SOLD_OUT","WINDOW_ENDED"];
+    function Uoe(e){ return (e??[]).some(t=>t.status==="ELIGIBLE") }        // 子项还有可领
+    function GPt(e){                                                        // true = 已领过 / 不可领
+      return Uoe(e.claimActions) ? !1
+        : $oe(e) ? (!!e.status && ENDED.includes(e.status))
+        : (e.taskMode==="CONTINUOUS"||e.taskMode==="NON_CONTINUOUS")
+            ? (e.taskStatus==="COMPLETED" && e.claimable===!1)
+            : (e.status!==null && e.status!==void 0 && e.status!=="ELIGIBLE");
+    }
+    ```
+
+    这是 v2.50 修的第二个根因：以前只看 `status in DONE_STATES`，
+    而 `status` 会一直停在 `ELIGIBLE`（用户 m25808 的截图就是这样），
+    真正的「已领」证据藏在另外两个地方：
+
+    1. **有 `claimActions`** —— 只要子项里还有一个 `ELIGIBLE` 就说明没领完，
+       全部非 ELIGIBLE 才算领完。**这种情况下父活动的 `status` 不可信。**
+    2. **任务型（`taskMode`）** —— 看 `taskStatus == COMPLETED` 且 `claimable is False`。
+    3. 其余（普通活动）才回落到 `status` 判据。
+
+    返回 True 表示「已领完 / 不可再领」。
+    """
+    if not isinstance(camp, dict) or not camp:
+        return False
+    acts = camp.get("claimActions")
+    if isinstance(acts, list) and acts:
+        # 还有任一子项 ELIGIBLE → 没领完
+        for a in acts:
+            if isinstance(a, dict) and (a.get("status") or "").upper() == "ELIGIBLE":
+                return False
+        return True
+    mode = (camp.get("taskMode") or "").upper()
+    if mode in TASK_MODES:
+        return (camp.get("taskStatus") or "").upper() == "COMPLETED" \
+            and camp.get("claimable") is False
+    state = (camp.get("status") or "").upper()
+    if not state:
+        return False
+    return state != "ELIGIBLE"
+
+
+def _claimable(camp) -> bool:
+    """能不能领 —— `_claimed()` 的否定，外加「活动已结束」也排除。"""
+    if not isinstance(camp, dict) or not camp:
+        return False
+    if _claimed(camp):
+        return False
+    return (camp.get("status") or "").upper() not in ENDED_STATES
+
+
 def find_daily(items) -> dict:
     """从活动列表里挑出**每日签到**活动。
 
-    判据顺序（对齐码道前端 `w_()` 的活动类型归一 + 用户实机看到的列表）：
+    判据（对齐码道前端 `GPt()` / `Uoe()` 与用户实机看到的列表）：
 
-    1. **每日签到类**（`DAILY_TYPES`）优先，其次才是「登录礼」类（`LOGIN_TYPES`）。
-       这一步是 v2.42 修的关键：`USER_LOGIN`（「新用户登录即送 4000 积分」）
-       和 `DAILY_CLAIM`（「每日签到领 100 积分」）在 delivery 里**同时存在**，
-       老代码把两者混在一个 `typed` 列表里、谁先 ELIGIBLE 就返回谁 ——
-       结果是领了「登录礼」、每日签到根本没动，回读自然还是 ELIGIBLE。
-       用户 m23825 的截图（「领取接口返回成功，但活动状态仍是 ELIGIBLE」）
-       就是这个错位造成的假失败。
-    2. 同一优先级内优先 `status == ELIGIBLE`（已领完的那项不该优先）；
-    3. `campaignId == 1`（2026-10 之前的老轮次写法）；
-    4. 兜底：全表只有一个可领项时才认它。
+    1. `type` 属于 `DAILY_TYPES`（已含 `USER_LOGIN`）的优先；
+    2. 同一优先级内优先**还能领**的（`_claimable()`），而不是只比 `status == ELIGIBLE`；
+    3. 再退到「全表唯一还能领的那个」；
+    4. 最后 `campaignId == 1`（2026-10 之前的老轮次写法）。
+
+    v2.42 那版把 `USER_LOGIN` 降级成「登录礼」是误判（见 `DAILY_TYPES` 注释），
+    v2.50 撤回；同时把「能不能领」的判据从 `status` 换成 `_claimable()`。
     """
     if not isinstance(items, list):
         return {}
@@ -336,28 +536,23 @@ def find_daily(items) -> dict:
 
     def pick(pool):
         for x in pool:
-            if (x.get("status") or "").upper() == "ELIGIBLE":
+            if _claimable(x):
                 return x
         return pool[0] if pool else {}
 
-    daily = [x for x in dicts
+    typed = [x for x in dicts
              if (x.get("type") or "").upper() in DAILY_TYPES]
-    hit = pick(daily)
+    hit = pick(typed)
     if hit:
         return hit
 
-    login = [x for x in dicts
-             if (x.get("type") or "").upper() in LOGIN_TYPES]
-    hit = pick(login)
-    if hit:
-        return hit
+    alive = [x for x in dicts if _claimable(x)]
+    if len(alive) == 1:
+        return alive[0]
 
     for x in dicts:
         if x.get("campaignId") == 1:
             return x
-    eligible = [x for x in dicts if (x.get("status") or "").upper() == "ELIGIBLE"]
-    if len(eligible) == 1:
-        return eligible[0]
     return {}
 
 
@@ -378,18 +573,90 @@ def find_by_id(items, cid) -> dict:
     return {}
 
 
+def fetch_tasks(cfg: dict) -> dict:
+    """取回任务进度，按 campaignId 建索引。返回 {campaignId: task}。
+
+    对齐码道前端 `rFt()`（`GET /ops/tasks/conversation?channel=WEB`）+ `p_`
+    的合并逻辑。返回体形如 `{"data":[{campaignId, mode, status, current,
+    threshold, benefitStatus, needRemindToday}, ...]}`。
+
+    失败一律返空 dict —— 任务进度只是**补充证据**，拿不到不该阻断签到
+    （delivery 里的 claimActions / status 仍然可用）。
+    """
+    cookie = _cookie_of(cfg)
+    if not has_session(cookie):
+        return {}
+    doc, _err = _api(TASKS_PATH + "?channel=WEB", cookie, proxy=cfg.get("proxy") or "")
+    if not isinstance(doc, dict):
+        return {}
+    data = doc.get("data")
+    if isinstance(data, dict):
+        data = data.get("items") or data.get("list") or []
+    if not isinstance(data, list):
+        return {}
+    out = {}
+    for t in data:
+        if not isinstance(t, dict):
+            continue
+        cid = t.get("campaignId")
+        if cid is None:
+            continue
+        out[str(cid)] = t
+    return out
+
+
+def merge_tasks(items, tasks) -> list:
+    """把任务进度合并进活动对象（原地改 + 返回同一个 list）。
+
+    逐字对齐码道前端 `p_`（v2.54 修正）：
+        F.taskCurrent = j.current;  F.taskThreshold = j.threshold;
+        F.taskMode = j.mode;        F.taskBenefitStatus = j.benefitStatus;
+        F.taskNeedRemindToday = j.needRemindToday;  F.taskStatus = j.taskStatus;
+
+    ⚠️ 最后一个字段是 `j.taskStatus`，**不是 `j.status`**。
+    v2.53 这里写成了 `("status", "taskStatus")`，而 tasks 接口的对象里
+    这个字段名就叫 `taskStatus` —— 于是 `"status" in t` 恒为假，
+    合并完 `taskStatus` 仍是空，症状与「根本没合并」完全一样
+    （用户 m26896 截图：`taskStatus=-`）。前五个字段名恰好两边同名，
+    只有这一个不同名，所以肉眼扫过去很难发现。
+
+    不合并的话 `taskStatus` 永远是空，`_claimed()` 的任务型分支
+    （`taskStatus == COMPLETED and claimable is False`）永远为假 ——
+    用户 m26306 那条「taskStatus=- claimable=true」就是这么来的。
+    """
+    if not isinstance(items, list) or not tasks:
+        return items
+    for x in items:
+        if not isinstance(x, dict):
+            continue
+        t = tasks.get(str(x.get("campaignId")))
+        if not isinstance(t, dict):
+            continue
+        for src, dst in (("current", "taskCurrent"), ("threshold", "taskThreshold"),
+                         ("mode", "taskMode"), ("benefitStatus", "taskBenefitStatus"),
+                         ("needRemindToday", "taskNeedRemindToday"),
+                         ("taskStatus", "taskStatus")):
+            if src in t:
+                x[dst] = t.get(src)
+    return items
+
+
 def fetch_delivery(cfg: dict):
-    """查活动列表。返回 (camp, items, err)。"""
+    """查活动列表。返回 (camp, items, err)。
+
+    除了 delivery，还会把 `tasks/conversation` 的任务进度合并进来 ——
+    缺了它 `taskStatus` 恒空，任务型活动永远判不出「已签」。
+    """
     cookie = _cookie_of(cfg)
     if not has_session(cookie):
         return {}, [], "未配置华为会话 Cookie（含 devclouddevuibjJ_SESSION_ID）"
     doc, err = _api(DELIVERY_PATH, cookie, proxy=cfg.get("proxy") or "")
     if doc is None:
         return {}, [], err
-    if doc.get("code") not in (0, None):
-        return {}, [], "华为活动查询失败 code=%s %s" % (
-            doc.get("code"), str(doc.get("message") or "")[:120])
+    if not _resp_ok(doc):
+        return {}, [], "华为活动查询失败 %s" % _resp_err(doc)
     items = ((doc.get("data") or {}).get("items")) or []
+    merge_tasks(items, fetch_tasks(cfg))
     camp = find_daily(items)
     if not camp:
         return {}, items, "未找到每日签到活动（活动可能已下线或换轮次）"
@@ -443,6 +710,35 @@ def today_done():
 def clear_today_done():
     try:
         os.remove(_mark_path())
+    except Exception:
+        pass
+
+
+# ─────────────────────────── user.login 上报 ───────────────────────────
+
+def _login_mark_path() -> str:
+    from .config import DATA_DIR
+    return os.path.join(str(DATA_DIR), "huawei_login_event.json")
+
+
+def login_reported_today() -> bool:
+    """今天是否已经上报过 `user.login`（对齐前端 `localStorage["lastLoginReportDate"]`）。"""
+    try:
+        with open(_login_mark_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return isinstance(d, dict) and d.get("date") == _today()
+    except Exception:
+        return False
+
+
+def _mark_login_reported(ok: bool):
+    if not ok:
+        return
+    try:
+        with open(_login_mark_path(), "w", encoding="utf-8") as f:
+            json.dump({"date": _today(),
+                       "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                      f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -617,9 +913,15 @@ def _ok_result(status: str, message: str, points: str = "", total: int = -1,
 def trigger_login(cfg: dict) -> tuple:
     """上报一次 `user.login` 事件。返回 (ok, err)。
 
-    码道前端每次进站都发（`o7t()`，一天一次）。不发的话，`USER_LOGIN` 类活动
-    在服务端可能一直停在「未达成」，delivery 里拿到的 status 就不会是 ELIGIBLE。
-    事件本身失败不该阻断签到 —— 调用方只记日志、继续往下走。
+    码道前端每次进站都发（`o7t()`，靠 `localStorage["lastLoginReportDate"]`
+    保证一天一次）。**无条件发，不判断活动状态** —— 前端的 `a7t()` 就是
+    在 App 启动时直接调的：
+
+        vn().isLoggedIn && a7t()
+
+    以前我们只在「活动既不可领也未领」时才发，条件太窄：当活动状态是
+    `claimable=true` 而 `taskStatus` 为空时（正是用户 m26306 的情形），
+    事件压根没发，服务端也就没有理由把任务标记成 COMPLETED。
     """
     cookie = _cookie_of(cfg)
     if not has_session(cookie):
@@ -633,9 +935,51 @@ def trigger_login(cfg: dict) -> tuple:
                     proxy=cfg.get("proxy") or "")
     if doc is None:
         return False, err
-    if doc.get("code") not in (0, None):
-        return False, "事件上报 code=%s %s" % (
-            doc.get("code"), str(doc.get("message") or "")[:120])
+    if not _resp_ok(doc):
+        return False, "事件上报 %s" % _resp_err(doc)
+    _mark_login_reported(True)
+    return True, ""
+
+
+def trigger_read(cfg: dict, cids) -> tuple:
+    """上报 `campaign.read`（对齐码道前端 `QPt()`）。
+
+    ```js
+    async function QPt(e, t = "WEB") {
+      const r = e.map(o => Number(o)).filter(o => Number.isInteger(o) && o >= 0);
+      if (r.length === 0) return { success: !1, error: "empty readCampaignIds" };
+      const a = r.slice().sort((o, i) => o - i);
+      return $s(await Gt.post({ url: `${so}/ops/events/trigger`,
+        body: { triggerEvent: "campaign.read", readCampaignIds: a,
+                idempotentKey: `read_${a.join("_")}`, channel: t },
+        headers: lo(), timeout: 1e4 }).toPromise());
+    }
+    ```
+
+    前端在活动列表**被渲染出来**时发（RedDot chunk 的 `markRead()`）。
+    码道的任务型活动（`taskMode` 非空）靠「读过」推进 `taskStatus`，
+    不发这个事件时 `taskStatus` 可能一直停在空/IN_PROGRESS，
+    claim 就成了空操作 —— 用户 m26306 那条红字正是这个形态。
+    `idempotentKey` 由 cids 决定（不含时间戳），重复发是幂等的。
+    """
+    cookie = _cookie_of(cfg)
+    if not has_session(cookie):
+        return False, "未配置华为会话 Cookie"
+    try:
+        ids = sorted({int(x) for x in (cids or []) if int(x) >= 0})
+    except Exception:
+        ids = []
+    if not ids:
+        return False, "empty readCampaignIds"
+    body = {"triggerEvent": "campaign.read", "readCampaignIds": ids,
+            "idempotentKey": "read_" + "_".join(str(i) for i in ids),
+            "channel": "WEB"}
+    doc, err = _api(EVENTS_PATH, cookie, method="POST", body=body,
+                    proxy=cfg.get("proxy") or "")
+    if doc is None:
+        return False, err
+    if not _resp_ok(doc):
+        return False, "阅读事件上报 %s" % _resp_err(doc)
     return True, ""
 
 
@@ -678,15 +1022,26 @@ def run(cfg: dict) -> dict:
                         "actions": len(x.get("claimActions") or [])})
         return out[:12]
 
-    # 活动里没有可领项时，先补一次 `user.login` 事件再重查 —— 这是码道前端
-    # 进站必做的事，不发的话 USER_LOGIN 类活动可能一直不进入 ELIGIBLE。
-    if (camp.get("status") or "").upper() not in DONE_STATES and \
-            (camp.get("status") or "").upper() != "ELIGIBLE":
-        ev_ok, ev_err = trigger_login(cfg)
-        if ev_ok:
-            camp2_try, _it, err_try = fetch_delivery(cfg)
-            if not err_try and camp2_try:
-                camp = camp2_try
+    # ── 进站第一件事：无条件上报 `user.login`（对齐前端 `a7t()`）──
+    # 前端是 `vn().isLoggedIn && a7t()`，只靠 localStorage 日期去重，**不看活动状态**。
+    # 以前我们只在「既不可领也未领」时才发，条件太窄：用户 m26306 那次
+    # `claimable=true` 且 `taskStatus` 为空，事件压根没发，服务端自然没理由
+    # 把 USER_LOGIN 任务标成 COMPLETED，于是 claim 200 但状态永不翻。
+    login_ok, login_err = False, ""
+    if not login_reported_today():
+        login_ok, login_err = trigger_login(cfg)
+        if login_ok:
+            # 事件刚上报，活动状态可能刚变（尤其 USER_LOGIN 类），重查一次
+            camp_try, _it, err_try = fetch_delivery(cfg)
+            if not err_try and camp_try:
+                camp = camp_try
+
+    # 紧接着补 `campaign.read`（对齐前端 RedDot 的 markRead）：码道的任务型活动
+    # 靠「读过」推进 taskStatus，不发的话 claim 是空操作。
+    # 幂等（idempotentKey 只由 cids 决定），重复发无副作用。
+    _rcid = camp.get("campaignId")
+    if _rcid is not None:
+        trigger_read(cfg, [_rcid])
 
     cid = camp.get("campaignId")
     if cid is None:
@@ -700,18 +1055,35 @@ def run(cfg: dict) -> dict:
     unit_cn = "积分" if unit == "CREDIT" else unit
     state = (camp.get("status") or "").upper()
 
-    if state in DONE_STATES:
+    # 「今天还能不能领」只信 `_claimed()`（对齐码道前端 `GPt()`），不看裸 status：
+    # status 会一直停在 ELIGIBLE，真正翻的是 claimActions 子项 / taskStatus+claimable。
+    if _claimed(camp):
         held = held_credits(cfg)
         msg = "今日已签到（%s %s）" % (amount if amount is not None else "?", unit_cn)
         mark_today_done("幂等跳过：今日已签", amount)
         return _ok_result("already", msg, total=held,
-                          detail={"campaign_id": cid, "status": state, "held": held})
+                          detail={"campaign_id": cid, "status": state,
+                                  "claim_actions": len(camp.get("claimActions") or []),
+                                  "held": held})
 
-    # 空 status 视为「可领」（服务端偶尔不下发 status）——
-    # 所以这里用 bool(state) 而不是裸 `state and ...`，让类型明确是 bool。
-    if camp.get("claimable") is False and bool(state) and state != "ELIGIBLE":
+    if not _claimable(camp):
+        # 任务型活动且任务没达成时，claim 是空操作（服务端 200 但什么都不改）。
+        # 这种情形要说清楚「是任务没完成」，不能让用户以为是网络或登录问题。
+        mode = (camp.get("taskMode") or "").upper()
+        tstat = (camp.get("taskStatus") or "").upper()
+        if mode in TASK_MODES and tstat != "COMPLETED":
+            return {"status": "fail", "http_status": None,
+                    "message": "码道的任务还没达成（taskStatus=%s，taskMode=%s，进度 %s/%s）。"
+                               "这一项要先在码道客户端或网页里完成任务动作才能领；"
+                               "软件已经把能做的（登录事件上报）都发了，"
+                               "若你在客户端里已经做过任务，隔几分钟再试一次"
+                               % (tstat or "-", mode,
+                                  camp.get("taskCurrent"), camp.get("taskThreshold")),
+                    "points": "", "detail": json.dumps(camp, ensure_ascii=False)[:400]}
         return {"status": "fail", "http_status": None,
-                "message": "签到活动当前不可领取（status=%s）" % (state or "?"),
+                "message": "签到活动当前不可领取（status=%s taskStatus=%s claimable=%s）"
+                           % (state or "?", camp.get("taskStatus") or "-",
+                              camp.get("claimable")),
                 "points": "", "detail": json.dumps(camp, ensure_ascii=False)[:400]}
 
     proxy = cfg.get("proxy") or ""
@@ -755,10 +1127,9 @@ def run(cfg: dict) -> dict:
                             {"campaign_id": cid, "benefit": bid, "claim_raw": raw_claim,
                              "error": err}, ensure_ascii=False)}
             raw_claim.append({"benefit": bid, "resp": doc})
-            if doc.get("code") not in (0, None):
+            if not _resp_ok(doc):
                 return {"status": "fail", "http_status": None,
-                        "message": "领取失败 code=%s %s（benefitId=%s）" % (
-                            doc.get("code"), str(doc.get("message") or "")[:140], bid),
+                        "message": "领取失败 %s（benefitId=%s）" % (_resp_err(doc), bid),
                         "points": "", "detail": json.dumps(doc, ensure_ascii=False)[:400]}
             claimed.append(bid)
     else:
@@ -770,10 +1141,9 @@ def run(cfg: dict) -> dict:
             return {"status": "fail", "http_status": None, "message": "领取失败：" + err,
                     "points": "", "detail": ""}
         raw_claim.append({"benefit": None, "resp": doc})
-        if doc.get("code") not in (0, None):
+        if not _resp_ok(doc):
             return {"status": "fail", "http_status": None,
-                    "message": "领取失败 code=%s %s" % (
-                        doc.get("code"), str(doc.get("message") or "")[:140]),
+                    "message": "领取失败 %s" % _resp_err(doc),
                     "points": "", "detail": json.dumps(doc, ensure_ascii=False)[:400]}
 
     doc2, err2 = _api(CONFIRM_PATH, cookie, method="POST",
@@ -786,10 +1156,9 @@ def run(cfg: dict) -> dict:
         return {"status": "fail", "http_status": None,
                 "message": "已领取但确认失败（下次会自动补确认）：" + err2,
                 "points": "", "detail": ""}
-    if doc2.get("code") not in (0, None):
+    if not _resp_ok(doc2):
         return {"status": "fail", "http_status": None,
-                "message": "签到确认失败 code=%s %s" % (
-                    doc2.get("code"), str(doc2.get("message") or "")[:140]),
+                "message": "签到确认失败 %s" % _resp_err(doc2),
                 "points": "", "detail": ""}
 
     # 只信回读：confirm 之后重新查一次，确认状态真的翻转了才记成功。
@@ -799,16 +1168,43 @@ def run(cfg: dict) -> dict:
     # 回读必须按 campaignId 定位同一个活动（`find_by_id`），不能重新 `find_daily`：
     # 签完之后原活动变成 CLAIMED，而列表里另一个同类活动（登录礼 / 学生认证）
     # 仍是 ELIGIBLE，重挑就会挑到别人身上，照样报「状态仍是 ELIGIBLE」。
+    #
+    # v2.53 补两件事（用户 m26306）：
+    # ① 回读**带重试**：码道的任务状态是异步结算的，claim/confirm 立刻回读
+    #    经常还是旧值（`taskStatus` 空、`claimable` 仍 true）。隔 1.5 秒重查
+    #    两三次，命中率明显不同。
+    # ② 重试之间**再补一次 `user.login`**：前端 `a7t()` 只在进站发一次，
+    #    我们在这里多发一次是幂等的（`idempotentKey` 带随机后缀），
+    #    但对 `USER_LOGIN` 类活动的任务结算有决定性作用。
     camp2, items2, err3 = fetch_delivery(cfg)
     same = find_by_id(items2, cid)
     state2 = (same.get("status") or camp2.get("status") or "").upper()
+    for attempt in range(READBACK_RETRIES):
+        if same and _claimed(same):
+            break
+        if not same and state2 in DONE_STATES:
+            break
+        if attempt >= READBACK_RETRIES - 1:
+            break
+        time.sleep(READBACK_GAP_SEC)
+        if attempt == 0 and not login_ok:
+            trigger_login(cfg)
+        camp2, items2, err3 = fetch_delivery(cfg)
+        same = find_by_id(items2, cid)
+        state2 = (same.get("status") or camp2.get("status") or "").upper()
     held = held_credits(cfg)
     gained = ("+%s" % amount) if amount else ""
     detail = {"campaign_id": cid, "camp_type": camp.get("type"), "amount": amount,
               "unit": unit, "state_after": state2, "held": held,
               "benefits": claimed, "claim_raw": raw_claim, "confirm_raw": raw_confirm,
               "activities_before": _brief(items), "activities_after": _brief(items2)}
-    if state2 in DONE_STATES:
+    # 成功判据同 `_claimed()`：不能只看 status（见 `_claimed` 的注释）。
+    # 回读时活动已经被领，`claimActions` 子项应当全部非 ELIGIBLE，父 status 可能还停在 ELIGIBLE。
+    if same and _claimed(same):
+        msg = "签到成功 %s%s" % (gained, unit_cn)
+        mark_today_done(msg, amount)
+        return _ok_result("success", msg, points=gained, total=held, detail=detail)
+    if not same and state2 in DONE_STATES:
         msg = "签到成功 %s%s" % (gained, unit_cn)
         mark_today_done(msg, amount)
         return _ok_result("success", msg, points=gained, total=held, detail=detail)
@@ -817,11 +1213,17 @@ def run(cfg: dict) -> dict:
         return {"status": "fail", "http_status": None,
                 "message": "领取与确认都返回成功，但回读失败无法证实：%s" % err3[:80],
                 "points": "", "detail": json.dumps(detail, ensure_ascii=False)}
+    acts2 = same.get("claimActions") if isinstance(same, dict) else None
+    pending = [a for a in (acts2 or []) if isinstance(a, dict)
+               and (a.get("status") or "").upper() == "ELIGIBLE"]
     return {"status": "fail", "http_status": None,
-            "message": "领取接口返回成功，但活动状态仍是 %s（未到账）。"
-                       "活动 type=%s、campaignId=%s。"
-                       "若反复出现请把这条发给我" % (
-                           state2 or "未知", camp.get("type") or "?", cid),
+            "message": "领取接口返回成功，但活动仍未翻状态（status=%s，"
+                       "还有 %d 个可领子项，taskStatus=%s claimable=%s）。"
+                       "活动 type=%s、campaignId=%s。若反复出现请把这条发给我" % (
+                           state2 or "未知", len(pending),
+                           (same.get("taskStatus") if isinstance(same, dict) else None) or "-",
+                           (same.get("claimable") if isinstance(same, dict) else None),
+                           camp.get("type") or "?", cid),
             "points": "", "detail": json.dumps(detail, ensure_ascii=False)}
 
 
@@ -864,8 +1266,8 @@ def probe(cfg: dict) -> dict:
         out["issues"].append("缺少华为会话 Cookie：点「登录华为码道」在站内登录一次")
         return out
     if not out["has_cftk"]:
-        out["issues"].append("Cookie 里没有 devclouddevuibtcftk（CSRF 令牌），"
-                             "领取会被拒 —— 请重新登录一次完整采集")
+        out["issues"].append("Cookie 里没有 %s（CSRF 令牌），领取会被拒 —— "
+                             "请重新登录一次完整采集" % CFTK_COOKIE)
     done = today_done()
     if done:
         out["reachable"] = True
@@ -879,9 +1281,10 @@ def probe(cfg: dict) -> dict:
         return out
     out["reachable"] = True
     state = (camp.get("status") or "").upper()
-    out["checked_in"] = state in DONE_STATES
+    out["checked_in"] = _claimed(camp)
     out["campaign_id"] = camp.get("campaignId")
     out["campaign_status"] = state
+    out["claim_actions"] = len(camp.get("claimActions") or [])
     out["amount"] = camp.get("benefitAmount")
     out["credit"] = _safe_credit(cfg)
     return out

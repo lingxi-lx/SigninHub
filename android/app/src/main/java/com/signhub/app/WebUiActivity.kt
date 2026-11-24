@@ -101,6 +101,40 @@ class WebUiActivity : ComponentActivity() {
         super.onResume()
         // 从多账号管理 / 登录页返回时，这里一定会走到
         flushReload()
+        // 用户可能在后台期间切过系统深浅色，而 Activity 未被重建时
+        // onConfigurationChanged 不一定补发 —— 回前台再刷一次主题（幂等）。
+        pushTheme()
+    }
+
+    /**
+     * 系统深浅色切换（「跟随系统」主题，用户 m27113 / m27260）。
+     *
+     * Manifest 里给 WebUiActivity 声明了 `uiMode`，所以这里会被调用而不是重建 Activity。
+     * 但**只靠 WebView 自己的 `prefers-color-scheme` 在鸿蒙上不可靠**：Activity 自己
+     * 吃掉 config change 之后，WebView 内部那份 Configuration 不会跟着更新，
+     * matchMedia 会一直返回旧值（用户实测「切深色不变星夜、关深色不变晨雾」，
+     * 两种方向都不变 —— 正是「值恒定」而不是「事件没来」）。
+     *
+     * 所以真正的判据走 [Bridge.sysDark]（读原生 `uiMode`），网页侧优先用它。
+     * 这里只负责「通知网页重算」，判据在网页那边。
+     *
+     * 不调 reloadWeb：重载会白屏 + 丢滚动位置，切个深浅色不值得。
+     */
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        pushTheme()
+    }
+
+    /** 让网页按「当前系统深浅色」重算一次主题；用户手选的星夜不会被系统改掉。 */
+    private fun pushTheme() {
+        try {
+            web.evaluateJavascript(
+                "(function(){try{var s=window.__signhub;" +
+                    "if(s&&s.applyTheme)s.applyTheme(s.currentThemeId());}catch(e){}})();",
+                null
+            )
+        } catch (_: Exception) {
+        }
     }
 
     private val notifPerm = registerForActivityResult(
@@ -196,6 +230,27 @@ class WebUiActivity : ComponentActivity() {
             builtInZoomControls = false
             mediaPlaybackRequiresUserGesture = false
             textZoom = 100
+        }
+        /*
+         * ★ 必须**关掉** algorithmic darkening（用户 m27452）。
+         *
+         * V2.56 我错开了 true，理由是「让 WebView 算出真实的 prefers-color-scheme」——
+         * 那是把两件事混成一件：algorithmic darkening 的作用是「页面没声明支持深色时，
+         * WebView 帮你把浅色页面自动反色」，它并不会让 matchMedia 更准。
+         *
+         * 打开的后果（截图 m27449 实测）：用户在设置页选「晨雾」（浅色），
+         * 界面仍然是深色 —— 因为 app.css 当时没有任何 `color-scheme` 声明，
+         * WebView 认定「这页只支持浅色」，于是系统处于深色时把整页强行暗化。
+         * 用户看到的现象就成了「跟随系统不管用 / 选了浅色也不变」。
+         *
+         * 我们的配色完全由 `html[data-theme]` 自己管（含 app.css 里显式的
+         * `color-scheme` 声明），不需要也不允许 WebView 代劳。
+         */
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+                androidx.webkit.WebSettingsCompat.setAlgorithmicDarkeningAllowed(web.settings, false)
+            }
+        } catch (_: Exception) {
         }
         web.isLongClickable = false
         web.setOnLongClickListener { true }
@@ -858,6 +913,233 @@ class WebUiActivity : ComponentActivity() {
                     } catch (_: Exception) {
                     }
                 }
+            }
+        }
+
+        /**
+         * 引导用户授予「精确闹钟」权限（V2.51）。
+         *
+         * Android 14+ 全新安装默认不授予 SCHEDULE_EXACT_ALARM，没有它
+         * `setExactAndAllowWhileIdle` 会抛 SecurityException、降级成 `setAndAllowWhileIdle`，
+         * 息屏后可能被推迟几小时 —— 这是「设了 8:30 却中午才签」的最常见原因。
+         *
+         * 注意：我们同时声明了 USE_EXACT_ALARM（安装即授予、不可撤销），
+         * 所以大多数设备进这里时已经是 true，只有个别 ROM 或用户手动关掉才需要引导。
+         */
+        @JavascriptInterface
+        fun openExactAlarmSettings() {
+            runOnUiThread {
+                try {
+                    if (android.os.Build.VERSION.SDK_INT < 31) {
+                        android.widget.Toast.makeText(
+                            this@WebUiActivity, "当前系统不需要这项授权", android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                        return@runOnUiThread
+                    }
+                    if (AutoCheckinScheduler.canExact(this@WebUiActivity)) {
+                        android.widget.Toast.makeText(
+                            this@WebUiActivity, "已允许精确定时，息屏也能准点签到",
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                        return@runOnUiThread
+                    }
+                    startActivity(Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)
+                        .setData(android.net.Uri.parse("package:$packageName")))
+                } catch (e: Exception) {
+                    // 个别 ROM 没有这个设置页，退到应用详情页（用户可自行找「闹钟和提醒」）
+                    try {
+                        startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                            .setData(android.net.Uri.parse("package:$packageName")))
+                    } catch (_: Exception) {
+                        android.widget.Toast.makeText(
+                            this@WebUiActivity, "打开设置失败：" + e.message,
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+        }
+
+        /** 打开本应用的自启动/后台管理页（国产 ROM 各家路径不同，能开哪个开哪个）。 */
+        @JavascriptInterface
+        fun openAutoStartSettings() {
+            runOnUiThread {
+                val candidates = listOf(
+                    // MIUI / HyperOS
+                    android.content.ComponentName(
+                        "com.miui.securitycenter",
+                        "com.miui.permcenter.autostart.AutoStartManagementActivity"
+                    ),
+                    // ColorOS / realme UI
+                    android.content.ComponentName(
+                        "com.coloros.safecenter",
+                        "com.coloros.safecenter.permission.startup.StartupAppListActivity"
+                    ),
+                    android.content.ComponentName(
+                        "com.oplus.safecenter",
+                        "com.oplus.safecenter.permission.startup.StartupAppListActivity"
+                    ),
+                    // vivo
+                    android.content.ComponentName(
+                        "com.vivo.permissionmanager",
+                        "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"
+                    ),
+                    // 华为 / 荣耀
+                    android.content.ComponentName(
+                        "com.huawei.systemmanager",
+                        "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"
+                    ),
+                    android.content.ComponentName(
+                        "com.hihonor.systemmanager",
+                        "com.hihonor.systemmanager.startupmgr.ui.StartupNormalAppListActivity"
+                    ),
+                )
+                for (cn in candidates) {
+                    try {
+                        startActivity(Intent().setComponent(cn)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        return@runOnUiThread
+                    } catch (_: Exception) {
+                        // 这家 ROM 没有这个页面，试下一个
+                    }
+                }
+                // 全都不认：退到应用详情页，用户可以在「电池 / 后台管理」里自己找
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                        .setData(android.net.Uri.parse("package:$packageName")))
+                } catch (_: Exception) {
+                    android.widget.Toast.makeText(
+                        this@WebUiActivity, "当前系统没有可打开的后台管理页",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+
+        /**
+         * 系统栏实际占位（dp），给网页兜底 `env(safe-area-inset-*)`。
+         *
+         * 为什么需要：网页靠 `env(safe-area-inset-top/bottom)` 自适应刘海与手势条，
+         * 但**鸿蒙（HarmonyOS）的 WebView 对这两个变量返回 0**，而 `setDecorFitsSystemWindows(false)`
+         * 已经让内容延伸进了状态栏/导航栏区域 → 顶部齿轮被系统状态栏盖住点不到、
+         * 底部 tab 栏和系统手势小横条重叠（用户 m26465）。
+         *
+         * 这里从 `WindowInsets` 直接读真实值，网页用 `max(env(...), var(--inset-*))` 取较大者，
+         * 两种来源哪个有值就用哪个 —— 不需要判断 ROM。
+         */
+        @JavascriptInterface
+        fun insets(): String {
+            return try {
+                val d = resources.displayMetrics.density
+                var top = 0
+                var bottom = 0
+                var cutout = 0
+                val v = window?.decorView
+                val wi = if (v != null) androidx.core.view.ViewCompat.getRootWindowInsets(v) else null
+                if (wi != null) {
+                    if (android.os.Build.VERSION.SDK_INT >= 30) {
+                        val bars = wi.getInsets(
+                            android.view.WindowInsets.Type.systemBars()
+                                or android.view.WindowInsets.Type.displayCutout()
+                        )
+                        top = bars.top
+                        bottom = bars.bottom
+                        cutout = wi.getInsets(android.view.WindowInsets.Type.displayCutout()).top
+                    } else {
+                        @Suppress("DEPRECATION")
+                        top = wi.systemWindowInsetTop
+                        @Suppress("DEPRECATION")
+                        bottom = wi.systemWindowInsetBottom
+                        @Suppress("DEPRECATION")
+                        cutout = wi.displayCutout?.safeInsetTop ?: 0
+                    }
+                }
+                // 降级：某些 ROM（含部分鸿蒙版本）在 Activity 刚创建时
+                // getRootWindowInsets 返回 null 或全 0，用系统资源里的栏高兜底。
+                if (top <= 0) top = statusBarHeightPx()
+                if (bottom <= 0) bottom = navBarHeightPx()
+                org.json.JSONObject().apply {
+                    put("top", Math.round(top / d))
+                    put("bottom", Math.round(bottom / d))
+                    put("cutout", Math.round(cutout / d))
+                    put("sdk", android.os.Build.VERSION.SDK_INT)
+                }.toString()
+            } catch (e: Exception) {
+                """{"top":0,"bottom":0,"cutout":0,"sdk":0,"error":"${e.message}"}"""
+            }
+        }
+
+        /** 状态栏高度（px）：`WindowInsets` 拿不到时的兜底。 */
+        private fun statusBarHeightPx(): Int {
+            val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+            if (id > 0) {
+                val h = resources.getDimensionPixelSize(id)
+                if (h > 0) return h
+            }
+            return Math.round(24 * resources.displayMetrics.density)
+        }
+
+        /**
+         * 导航栏 / 手势条高度（px）：`WindowInsets` 拿不到时的兜底。
+         *
+         * 注意：全面屏手势条的 dimen 名在不同 ROM 上不一样，逐个试；
+         * 全都不认时按「手势导航」给 24dp —— 宁可多留一点也不能让 tab 栏被压住。
+         */
+        private fun navBarHeightPx(): Int {
+            val names = listOf(
+                "navigation_bar_height",
+                "navigation_bar_height_landscape",
+                "navigation_bar_gesture_height",
+            )
+            for (n in names) {
+                val id = resources.getIdentifier(n, "dimen", "android")
+                if (id > 0) {
+                    val h = resources.getDimensionPixelSize(id)
+                    if (h > 0) return h
+                }
+            }
+            return Math.round(24 * resources.displayMetrics.density)
+        }
+
+        /**
+         * 系统当前是不是深色模式（「跟随系统」主题的唯一可信判据）。
+         *
+         * 为什么不直接用网页的 `matchMedia('(prefers-color-scheme: dark)')`：
+         * 我们在 Manifest 里声明了 `uiMode`，Activity 自己吃掉 config change 之后，
+         * WebView 内部那份 Configuration **不会跟着更新**，matchMedia 会一直返回旧值。
+         * 用户 m27260 实测「手机切深色没变星夜、关掉深色没变晨雾」—— 两个方向都不变，
+         * 正是「值恒定」的特征，而不是「change 事件没来」。
+         *
+         * 这里读的是原生 `resources.configuration.uiMode`，Activity 已收到新的
+         * Configuration，所以一定是最新值。网页侧拿到 "1"/"0" 后优先用它，
+         * 桥不可用（电脑端浏览器）才回落 matchMedia。
+         */
+        @JavascriptInterface
+        fun sysDark(): String {
+            return try {
+                val night = (resources.configuration.uiMode and
+                    android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+                    android.content.res.Configuration.UI_MODE_NIGHT_YES
+                if (night) "1" else "0"
+            } catch (e: Exception) {
+                ""
+            }
+        }
+
+        /** 后台可靠性现状，给设置页面板渲染用。 */
+        @JavascriptInterface
+        fun bgStatus(): String {
+            return try {
+                val pm = getSystemService(android.os.PowerManager::class.java)
+                val batteryOk = pm?.isIgnoringBatteryOptimizations(packageName) == true
+                org.json.JSONObject().apply {
+                    put("sdk", android.os.Build.VERSION.SDK_INT)
+                    put("exact_ok", AutoCheckinScheduler.canExact(this@WebUiActivity))
+                    put("battery_ok", batteryOk)
+                    put("next_pick", AutoCheckinScheduler.nextPickAt(this@WebUiActivity))
+                }.toString()
+            } catch (e: Exception) {
+                """{"sdk":0,"exact_ok":false,"battery_ok":false,"next_pick":0,"error":"${e.message}"}"""
             }
         }
 
