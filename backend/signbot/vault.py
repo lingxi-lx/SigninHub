@@ -80,6 +80,7 @@ import hmac
 import os
 import sys
 import threading
+import time
 from ctypes import wintypes
 
 PREFIX = "dpapi:"
@@ -111,7 +112,34 @@ SENSITIVE_PATHS = [
 
 _failed = set()          # {(prov, sect, key)} 本轮解密失败过的字段
 _cleared = set()         # {(prov, sect, key)} 用户主动清空的字段（不参与还原）
+_enc_failed = set()      # {(prov, sect, key)} 加密失败、只能明文落盘的字段（BUGS-v2.63-291 P2-2）
+_enc_reason = ""         # 最近一次加密失败的原因，仅供日志/诊断
+_enc_warned = False      # 只提示一次，别每次保存都刷屏
+_can_cache = None        # can_encrypt() 的缓存：True 缓到进程结束，False 只缓 _CAN_TTL 秒
+_can_cache_at = 0.0
+_CAN_TTL = 15.0
 _lock = threading.Lock()
+
+
+def _note_seal_failure(reason: str) -> None:
+    """记下「这次没能加密」。**这是安全降级，必须让人看见**，不能静默。"""
+    global _enc_reason, _enc_warned
+    with _lock:
+        _enc_reason = reason or "unknown"
+        first = not _enc_warned
+        _enc_warned = True
+    if first:
+        try:
+            print("[vault] 本机加密不可用（%s），凭据将以明文写入 config.json —— "
+                  "请检查系统密钥/目录权限，修好后重新保存一次凭据可自动恢复加密。"
+                  % (reason or "unknown"))
+        except Exception:
+            pass
+
+
+def note_seal_failure(reason: str) -> None:
+    """公开入口：vault 之外的模块（config.py）发现「这轮没加密」时也要留痕。"""
+    _note_seal_failure(reason)
 
 
 class _DATA_BLOB(ctypes.Structure):
@@ -222,6 +250,28 @@ def _can_seal() -> bool:
     return _subkeys()[0] is not None
 
 
+def _dpapi_seal(plain: str):
+    """DPAPI 密封：成功返回 `dpapi:` 串，失败返回 None。
+
+    **纯函数：不登记 `_enc_failed`、不改 `_enc_reason`、不打日志。**
+    调用方（`protect` / `can_encrypt`）自己决定失败要不要留痕。
+    """
+    din = _blob(plain.encode("utf-8"))
+    dout = _DATA_BLOB()
+    ok = ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(din), None, None, None, None, 0, ctypes.byref(dout)
+    )
+    if not ok:
+        return None
+    try:
+        raw = ctypes.string_at(dout.pbData, dout.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(dout.pbData)
+    if not raw:
+        return None
+    return PREFIX + base64.b64encode(raw).decode("ascii")
+
+
 def protect(plain: str) -> str:
     """明文 → 密文。空串 / 掩码值 / 已加密时原样返回。"""
     if not plain or plain[:8].startswith((PREFIX, SEAL_PREFIX)):
@@ -230,23 +280,23 @@ def protect(plain: str) -> str:
         return plain
     if _available():
         try:
-            din = _blob(plain.encode("utf-8"))
-            dout = _DATA_BLOB()
-            ok = ctypes.windll.crypt32.CryptProtectData(
-                ctypes.byref(din), None, None, None, None, 0, ctypes.byref(dout)
-            )
-            if not ok:
-                return plain
-            try:
-                raw = ctypes.string_at(dout.pbData, dout.cbData)
-            finally:
-                ctypes.windll.kernel32.LocalFree(dout.pbData)
-            return PREFIX + base64.b64encode(raw).decode("ascii")
-        except Exception:
+            sealed = _dpapi_seal(plain)
+        except Exception as e:
+            _note_seal_failure(str(e))
             return plain
+        if sealed is None:
+            # BUGS-v2.63-291 P2-2：以前这里静默 return plain，明文落盘且
+            # /api/status 仍报 crypto_ok=true。现在至少留下可诊断的痕迹，
+            # 由 encrypt_config() 把具体字段登记进 _enc_failed。
+            _note_seal_failure("CryptProtectData 返回 0")
+            return plain
+        return sealed
     # 非 Windows：走本地密钥的 sealed 通道。密钥建不出来才原样返回（不写坏配置）。
     sealed = _seal(plain)
-    return sealed if sealed is not None else plain
+    if sealed is None:
+        _note_seal_failure("vault.key 不可用")
+        return plain
+    return sealed
 
 
 def unprotect(value: str) -> str:
@@ -277,6 +327,38 @@ def unprotect(value: str) -> str:
         return SENTINEL
 
 
+def can_encrypt() -> bool:
+    """本机**此刻**能不能把凭据加密（与「最近一次保存有没有失败」无关）。
+
+    BUGS-v2.63-293 P3：`_enc_failed` 只是保存时的副作用 —— 用户点「知道了」把它
+    清空、或进程重启（内存集合）之后，就没有任何东西会重新填充它，于是
+    `/api/status` 永久报 `crypto_ok=true`，而 config.json 里的凭据仍是明文。
+
+    BUGS-v2.63-294 P3：这里**不能借道 `protect()`** —— 那条路径失败时会写
+    `_enc_reason` / `_enc_warned` 并打印警告，而本函数由 25 秒轮询的
+    `/api/status` 调用，会把「只提示一次」的额度用掉、并用探测原因覆盖真实事故
+    原因。现在直接调无副作用的 `_dpapi_seal` / `_subkeys`，不登记、不打日志。
+
+    结果按进程缓存：True 缓到结束（真出问题时 `encrypt_config()` 仍会登记字段
+    失败），False 只缓 `_CAN_TTL` 秒 —— 用户修好权限后最多等 15 秒横幅就消。
+    `reset_failures()` 会同时失效缓存。
+    """
+    global _can_cache, _can_cache_at
+    with _lock:
+        if _can_cache is True:
+            return True
+        if _can_cache is False and (time.monotonic() - _can_cache_at) < _CAN_TTL:
+            return False
+    try:
+        ok = bool(_dpapi_seal("signhub-can-encrypt-probe")) if _available() else _can_seal()
+    except Exception:
+        ok = False
+    with _lock:
+        _can_cache = ok
+        _can_cache_at = time.monotonic()
+    return ok
+
+
 def failures():
     """本轮解密失败过的字段路径（`prov.sect.key` 字符串列表）。"""
     with _lock:
@@ -285,9 +367,14 @@ def failures():
 
 def reset_failures():
     """清空失败名单（前端横幅点「知道了」/ 重新填完凭据后调用）。"""
+    global _enc_warned, _can_cache
     with _lock:
         _failed.clear()
         _cleared.clear()
+        _enc_failed.clear()
+        _enc_warned = False
+        # 能力缓存一并失效：点「知道了」之后必须重新探测，不能拿缓存里的旧结论。
+        _can_cache = None
 
 
 def mark_cleared(paths):
@@ -311,8 +398,38 @@ def encrypt_config(cfg: dict) -> dict:
             continue
         cur = node.get(key)
         if isinstance(cur, str):
-            node[key] = protect(cur)
+            out = protect(cur)
+            node[key] = out
+            # 加密「成功与否」按字段逐个判定：本来就该原样返回的三种形态
+            # （空串 / 已是密文 / 掩码 ***）不算失败，其余「进了 protect 又原样出来」
+            # 就是这次没能加密 → 登记，供 /api/status 的 crypto_ok 报出来。
+            with _lock:
+                if _looks_plain(cur) and out == cur:
+                    _enc_failed.add((prov, sect, key))
+                else:
+                    _enc_failed.discard((prov, sect, key))
     return cfg
+
+
+def _looks_plain(v: str) -> bool:
+    """这串值「本应被加密」吗？空串 / 已加密 / 掩码都不算。"""
+    if not v:
+        return False
+    if v.startswith((PREFIX, SEAL_PREFIX)):
+        return False
+    return "***" not in v
+
+
+def encrypt_failures():
+    """本轮加密失败、只能明文落盘的字段路径（`prov.sect.key`）。"""
+    with _lock:
+        return sorted("%s.%s.%s" % p for p in _enc_failed)
+
+
+def encrypt_reason() -> str:
+    """最近一次加密失败的原因（给日志/诊断用，不直接展示给用户）。"""
+    with _lock:
+        return _enc_reason
 
 
 def decrypt_config(cfg: dict) -> dict:

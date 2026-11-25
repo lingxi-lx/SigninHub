@@ -12,7 +12,7 @@ private val Context.dataStore by preferencesDataStore(name = "signhub_settings")
 
 data class AppSettings(
     // 遥控 PC 后端（原有）
-    val serverUrl: String = "http://192.168.1.100:8787",
+    val serverUrl: String = "",
     val token: String = "",
     val reminderEnabled: Boolean = false,
     val reminderTime: String = "08:30",
@@ -155,7 +155,7 @@ object SettingsStore {
             return out
         }
         AppSettings(
-            serverUrl = p[KEY_URL] ?: "http://192.168.1.100:8787",
+            serverUrl = p[KEY_URL] ?: "",
             token = d(p[KEY_TOKEN] ?: ""),
             reminderEnabled = p[KEY_REMINDER_ON] ?: false,
             reminderTime = p[KEY_REMINDER_TIME] ?: "08:30",

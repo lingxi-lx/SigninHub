@@ -26,7 +26,7 @@ android {
         applicationId = "com.signhub.app"
         minSdk = 26
         targetSdk = 34
-    versionCode = 291
+    versionCode = 295
         versionName = "2.63"
 
         // L12（BUGS-v2.61）：只保留真机 ABI。原来打出来的 APK 带 arm64-v8a /

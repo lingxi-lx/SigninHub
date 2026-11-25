@@ -156,6 +156,10 @@ def run_test(key: str) -> dict:
     providers = build_providers(cfg)
     if key not in providers:
         raise KeyError(f"unknown provider: {key}")
+    # 与 run_one 同构（BUGS-v2.63-291 P3-1）：本函数注释声称「四个入口统一」，
+    # 之前只有 server 层拦了 retired，任何新调用点（CLI / 未来路由）都能打已下线服务。
+    if key not in active_keys(cfg):
+        raise KeyError(f"retired provider: {key}")
     prov = providers[key]
     day = db.today_str(cfg["scheduler"].get("timezone_offset_hours", 8))
     with _key_lock(key):

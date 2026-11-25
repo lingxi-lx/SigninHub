@@ -568,26 +568,26 @@ class LoginWebActivity : Activity() {
      * Trae 官网/客户端不会给这个提示，所以必须写在这里。
      */
     private fun showTraeRiskNotice(onProceed: () -> Unit) {
-        status.text = "先看一条提示：Trae 新号直接签到容易被风控"
-        // 用户 m28007：把「我知道了，继续登录」改成「已阅读，继续登录」，并且换成
-        // **长按确认**（按住时沿边框走进度，未满松手回弹，填满变「已确认」并轻震），
-        // 同时删掉「先不登录」那颗按钮 —— 退出改用安卓返回键（onCancel）。
-        // 少一颗并排按钮后正文和按钮都拿到更宽的空间，不再挤。
+        status.text = "先看一条提示：还没注册 Trae 的话，先注册再登录签到"
+        // 正文改成「注册引导 + 邀请链接」（用户要求）：
+        // 这段提示的原始目的就是让用户先去官网注册、正常用一会儿再回来签到，
+        // 直接给可点的注册入口比罗列 9074 的成因更短、更可执行。
+        // 9074 的完整解释仍留在「点签到后的失败文案」里（LocalCheckin.trae 的说明），
+        // 真被风控时用户仍然看得到原因与出路。
+        //
+        // 按钮仍是长按确认（用户 m28007）：按住沿边框走进度、未满松手回弹、
+        // 填满变「已确认」并轻震；退出走安卓返回键（onCancel）。
         SignDialog.holdConfirm(
             this,
-            kicker = "TRAE · 风控提示",
+            kicker = "TRAE · 注册提示",
             title = "先到官网注册，再用本软件签到",
-            message = "Trae 对「刚注册就直接自动签到」的账号查得很严：新号注册当天就签到，" +
-                "很容易被记一笔风控，之后一直报 9074。\n\n" +
-                "怎么算被风控：在本软件点「签到」，红字里出现 9074" +
-                "（ErrWorkRiskControlBanned）就是 —— 官网和客户端都不会提示你，只有这里能看出来。\n\n" +
-                "建议顺序：\n" +
-                "① 先到 trae.cn 官网注册，正常登录用一会儿（写几行代码、开一次会话都算）；\n" +
-                "② 隔几小时（最好隔一天）再用本软件登录签到；\n" +
-                "③ 已经报 9074 的，等 12~24 小时再试，期间别反复点测试、也别改设备号。",
+            message = "是否还没有注册 TRAE，点击下方网址进行注册后再登录签到",
             holdText = "已阅读，继续登录",
             holdHint = "长按不放 · 填满边框即确认",
             confirmedText = "已确认",
+            // 点一下开浏览器去注册；长按复制（见 SignDialog.holdConfirm 的 linkUrl）
+            linkUrl = "https://www.trae.cn/events/code-fission/8ZZYZW5HDUGC" +
+                "?utm_source=copy_link&utm_medium=code_fission",
             onOk = onProceed,
             onCancel = { finish() },
         )

@@ -2,9 +2,15 @@ package com.signhub.app
 
 import android.app.Activity
 import android.app.Dialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -16,6 +22,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 
 /**
  * 全软件统一的圆角弹窗。
@@ -163,6 +170,17 @@ object SignDialog {
         holdText: String,
         holdHint: String = "长按不放，填满边框即确认",
         confirmedText: String = "已确认",
+        /**
+         * 正文下方追加一条可点的链接（点开浏览器 / 长按复制）。
+         *
+         * 为什么单独一个 TextView 而不是把 URL 拼进 message 再用 Linkify：
+         * 这类链接很长（带 utm 参数），拼进正文后会在任意位置折行、和正文混在一起，
+         * 复制时容易把前后文字一起选中；单独一行既好点也好复制。
+         *
+         * **必须排在 onCancel / onOk 之前** —— 这两个后面天天被尾随 lambda 或命名参数调用，
+         * 新参数插到尾部会把所有老调用点的 lambda 绑错位置（见 confirm 的同款注释）。
+         */
+        linkUrl: String? = null,
         onCancel: (() -> Unit)? = null,
         onOk: () -> Unit,
     ) {
@@ -177,6 +195,33 @@ object SignDialog {
             setLineSpacing(dp(activity, 4).toFloat(), 1.38f)
             setPadding(dp(activity, 20), dp(activity, 4), dp(activity, 20), dp(activity, 18))
         })
+        if (!linkUrl.isNullOrBlank()) {
+            card.addView(TextView(activity).apply {
+                text = linkUrl
+                setTextColor(BRAND)
+                textSize = 12.5f
+                setLineSpacing(dp(activity, 3).toFloat(), 1.3f)
+                // 正文下沿 18dp，这里回到 4dp：两块属于同一段话，别被间隙切断
+                setPadding(dp(activity, 20), 0, dp(activity, 20), dp(activity, 18))
+                paintFlags = paintFlags or Paint.UNDERLINE_TEXT_FLAG
+                isClickable = true
+                isLongClickable = true
+                // 点一下：开浏览器去注册；长按：复制链接（没装浏览器 / 想发给别人时用）
+                setOnClickListener {
+                    try {
+                        activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(linkUrl)))
+                    } catch (_: Exception) {
+                        copyLink(activity, linkUrl)
+                        Toast.makeText(activity, "没有可用浏览器，链接已复制", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                setOnLongClickListener {
+                    copyLink(activity, linkUrl)
+                    Toast.makeText(activity, "链接已复制", Toast.LENGTH_SHORT).show()
+                    true
+                }
+            })
+        }
 
         val bar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -199,6 +244,15 @@ object SignDialog {
             onCancel?.invoke()
         }
         finish(activity, dlg, card)
+    }
+
+    /** 复制链接到剪贴板；失败（极少数 ROM 限制）就静默，别让复制把弹窗搞崩。 */
+    private fun copyLink(activity: Activity, url: String) {
+        try {
+            val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("link", url))
+        } catch (_: Exception) {
+        }
     }
 
     // ────────────────────────── 表单 ──────────────────────────

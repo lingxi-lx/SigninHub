@@ -306,8 +306,19 @@ def _save_locked(cfg: dict) -> None:
         # 再统一加密（protect 对 `dpapi:` 前缀幂等，不会二次加密）。
         vault.restore_failed(disk)
         vault.encrypt_config(disk)
-    except Exception:
-        pass
+    except Exception as e:
+        # BUGS-v2.63-293 观察项：这里以前 except: pass，vault 整体异常时
+        # disk 仍是明文，直接落盘且没有任何记录。现在至少留痕（能 import 就登记，
+        # 连 import 都失败就 stderr 打一行）。不抛异常 —— 「vault 坏掉仍能保存」
+        # 是既有取舍，改它会连累整套设置页。
+        try:
+            from . import vault as _vault
+            _vault.note_seal_failure("保存前加密异常: %s" % e)
+        except Exception:
+            try:
+                print("[vault] 本机加密流程异常（%s），本次配置可能以明文落盘。" % e)
+            except Exception:
+                pass
     tmp = CONFIG_PATH.with_suffix(".json.tmp")
     # H3：先建 0600 的临时文件再写 —— 不要「先 open 写、写完再 chmod」，
     # 中间那段窗口里文件是默认权限，同机别的用户能读到密文与密钥路径。

@@ -41,13 +41,30 @@ def _mask(v: str) -> str:
 
 
 def _crypto_brief():
-    """(crypto_ok, creds_lost) —— 电脑端凭据加密状态，供前端横幅判断。"""
+    """(crypto_ok, creds_lost) —— 电脑端凭据加密状态，供前端横幅判断。
+
+    BUGS-v2.63-291 P2-2：以前只看 `vault.failures()`（解密失败名单），
+    加密降级（DPAPI 不可用 / vault.key 建不出来 → 明文落盘）完全看不见，
+    于是前端横幅一直显示「加密正常」。现在两个方向都报：
+      · 解密失败 → creds_lost，横幅提示「系统密钥已变更，请重新填写凭据」；
+      · 加密失败 → crypto_ok=False，横幅提示「本机凭据未加密」。
+    BUGS-v2.63-293 P3：`encrypt_failures()` 是「保存时的副作用」，点一次「知道了」
+    （`reset_failures()`）或重启进程后就空了，于是永久报 crypto_ok=true。
+    这里再加一道**主动能力探测** `vault.can_encrypt()`：不看历史记录，现场试一次。
+    """
     try:
         from . import vault
         lost = vault.failures()
-        return (len(lost) == 0), lost
+        enc = vault.encrypt_failures()
+        try:
+            can = vault.can_encrypt()
+        except Exception:
+            can = False
+        return (len(lost) == 0 and len(enc) == 0 and can), lost
     except Exception:
-        return True, []
+        # vault 模块自己挂了 = 这轮一定没有加密。宁可横幅多弹一次，
+        # 也不能在凭据可能明文落盘时告诉前端「一切正常」。
+        return False, []
 
 
 # ---------------------------------------------------------------------------

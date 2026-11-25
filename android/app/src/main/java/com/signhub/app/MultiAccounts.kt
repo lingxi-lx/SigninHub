@@ -223,6 +223,11 @@ object TraeAccountStore {
                 id = old.id,
                 token = acc.token.ifBlank { old.token },
                 session = acc.session.ifBlank { old.session },
+                // Raw 与明文同进退（BUGS-v2.63-291 P2-1）：解密失败时明文是空串、
+                // 只有 Raw 还握着磁盘上的密文，这里不沿用就等于让 toJson 写出空串，
+                // 旧密文被永久抹掉 —— 用户必须重登。范式见 WbMulti.kt:187-188。
+                tokenRaw = if (acc.token.isBlank()) old.tokenRaw else acc.tokenRaw,
+                sessionRaw = if (acc.session.isBlank()) old.sessionRaw else acc.sessionRaw,
                 deviceId = acc.deviceId.ifBlank { old.deviceId },
                 lastStatus = old.lastStatus, lastMessage = old.lastMessage,
                 lastCheckAt = old.lastCheckAt, totalPoints = old.totalPoints,
@@ -436,6 +441,9 @@ object QoderAccountStore {
                 id = old.id,
                 token = acc.token.ifBlank { old.token },
                 refresh = acc.refresh.ifBlank { old.refresh },
+                // 同上（P2-1）：drt- 是长期凭据，丢了只能重新扫码
+                tokenRaw = if (acc.token.isBlank()) old.tokenRaw else acc.tokenRaw,
+                refreshRaw = if (acc.refresh.isBlank()) old.refreshRaw else acc.refreshRaw,
                 uid = acc.uid.ifBlank { old.uid },
                 machineId = acc.machineId.ifBlank { old.machineId },
                 lastStatus = old.lastStatus, lastMessage = old.lastMessage,
@@ -586,6 +594,8 @@ object MmAccountStore {
                 id = old.id,
                 token = acc.token.ifBlank { old.token },
                 userId = acc.userId.ifBlank { old.userId },
+                // 同上（P2-1）：token 解不开时保留原密文，别写出空串
+                tokenRaw = if (acc.token.isBlank()) old.tokenRaw else acc.tokenRaw,
                 deviceId = acc.deviceId.ifBlank { old.deviceId },
                 lastStatus = old.lastStatus, lastMessage = old.lastMessage,
                 lastCheckAt = old.lastCheckAt, totalPoints = old.totalPoints,
@@ -829,6 +839,10 @@ object HwAccountStore {
                 id = old.id,
                 cookie = acc.cookie.ifBlank { old.cookie },
                 authCookie = acc.authCookie.ifBlank { old.authCookie },
+                // 同上（P2-1）：整条 Cookie 与 auth 域 Cookie 都靠 Raw 兜底，
+                // 少任一条，Keystore 短暂不可用时就会把静默重登能力写没。
+                cookieRaw = if (acc.cookie.isBlank()) old.cookieRaw else acc.cookieRaw,
+                authCookieRaw = if (acc.authCookie.isBlank()) old.authCookieRaw else acc.authCookieRaw,
                 lastStatus = old.lastStatus, lastMessage = old.lastMessage,
                 lastCheckAt = old.lastCheckAt, totalPoints = old.totalPoints,
                 streakDays = old.streakDays, usedPoints = old.usedPoints,

@@ -615,10 +615,20 @@
     let watchdog = 0;
     const armWatchdog = () => {
       watchdog = setTimeout(() => {
-        if (!btn.classList.contains("busy")) return;
+        // 95 秒里 25 秒轮询必然重建过 #stack（约 3 次），btn 是点击时抓的那个旧节点。
+        // 只摘旧节点的 class，屏幕上的新按钮会永久停在转圈（BUGS-v2.63-291 P3-2）——
+        // 这里和正常路径一样，先按 data-key + data-acct 找当前节点再动。
+        const liveCard = $$(`#stack .svc[data-key="${key}"]`).find(
+          (el) => (el.dataset.acct || "") === acctKey) || svcEl;
+        const liveBtn = $(".ckbtn", liveCard);
+        if (!liveBtn || !liveBtn.classList.contains("busy")) return;
         busyKeys.delete(key);
-        btn.classList.remove("busy");
-        btn.classList.add("fail");
+        liveBtn.classList.remove("busy");
+        liveBtn.classList.add("fail");
+        // 顺带把副标题换掉：只弹 toast 的话，过一会儿没人记得这张卡为什么是叉。
+        // 不改积分/总分（markSvcResult 会把 res.points 当空值清屏），只动文案。
+        const subTxt = $(".svc-subtxt", liveCard);
+        if (subTxt) subTxt.textContent = "无响应 · 可再点一次";
         toast(`${LABELS[key] || key} 无响应：等了 95 秒仍未拿到结果，可再点一次重试`, 4000);
       }, 95000);
     };
@@ -1773,8 +1783,9 @@
    * P1-1 只做到「不覆盖密文」，但界面照旧显示「未配置」，用户不知道要重新登录。
    * lost=true  → 红黄横幅「系统密钥已变更，请重新填写凭据」；
    * lost=false 但 cryptoOk=false → 说明加密一直失败、凭据正以明文落盘。
-   * 用户点「知道了」后本进程内不再弹（localStorage 记住），但下次启动会再提醒一次 ——
-   * 凭据丢了这件事不能永久静音。
+   * 用户点「知道了」后本标签页内不再弹（sessionStorage 记住），但下次启动会再提醒一次
+   * —— 凭据丢了这件事不能永久静音。crypto_ok 的真值只由后端能力探测决定
+   * （BUGS-v2.63-293 P3），前端不写死。
    */
   const CREDS_TITLE_LOST = "系统密钥已变更，请重新填写凭据";
   const CREDS_SUB_LOST = "本机加密密钥丢失（换机 / 清数据 / 移除锁屏密码都会导致），旧凭据已无法解密。为免覆盖仍完好的密文，程序保留了原值未删除 —— 重新登录或重填一次即可恢复。";
@@ -1806,9 +1817,17 @@
       // P2 N4（BUGS-v2.3）：SecretBox.reset() 以前没有任何调用方 —— 用户点「知道了」
       // 只是把横幅藏起来，crypto_ok 还是 false，下次 loadAll 又弹出来，只能等
       // Keystore 恰好自己恢复。这里真的复位一次失败计数再刷横幅。
+      //
+      // BUGS-v2.63-293 P3：**不要**把 crypto_ok 写死成 true。它原来一写就盖掉了
+      // 后端/本机的能力探测结果 —— 用户点一次「知道了」，即使凭据仍是明文，
+      // /api/status 之后也永远报加密正常。以接口返回值为准（Android 是
+      // SecretBox.healthy()，电脑端是 vault.can_encrypt()），只保留「本页不再弹」
+      // 这个纯前端开关（sessionStorage），下次启动横幅会重新按真实能力判断。
       try {
-        await api("/api/crypto_reset", { method: "POST" });
-        if (state.status) state.status.crypto_ok = true;
+        const res = await api("/api/crypto_reset", { method: "POST" });
+        if (state.status && res && typeof res.crypto_ok === "boolean") {
+          state.status.crypto_ok = res.crypto_ok;
+        }
         refreshCredsAlert();
       } catch (_) {}
     });
@@ -3911,26 +3930,6 @@
     }, gap);
   }
   schedulePoll();
-
-  /* 复现用：自动点一次 WorkBuddy 的「测试签到」 */
-  if (location.hash.includes("curltest")) {
-    const sample = "curl 'https://api.trae.cn/trae/api/v2/ug/checkin_credits/status' \\\n  -H 'accept: application/json' \\\n  -H 'authorization: Cloud-IDE-JWT eyJ0.abc.def' \\\n  --data-raw '{\"req_source\":1}' \\\n  --compressed";
-    const r = parseCurlCommand(sample);
-    document.title = "CURL url=" + r.url + " method=" + r.method +
-      " hdrs=" + Object.keys(r.headers).join(",") + " body=" + r.body;
-  }
-  if (location.hash.includes("autotest")) {
-    setTimeout(() => {
-      try {
-        const card = document.querySelector('.prov-card[data-key="workbuddy"]');
-        if (!card) { reportErr("autotest", "workbuddy card not found"); return; }
-        card.classList.add("open");
-        const btn = card.querySelector(".pv-test");
-        if (!btn) { reportErr("autotest", "test button not found"); return; }
-        btn.click();
-      } catch (e) { reportErr("autotest", e.message); }
-    }, 900);
-  }
 
   /* ============================================================
      ⑧ 庆祝彩带：全屏 canvas confetti
