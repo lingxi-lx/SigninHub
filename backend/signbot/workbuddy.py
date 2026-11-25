@@ -23,6 +23,8 @@ import time
 import urllib.error
 import urllib.request
 
+from . import netguard
+
 CN_CHAT_BASE = "https://copilot.tencent.com"
 CN_BILLING_BASE = "https://www.codebuddy.cn"
 GLOBAL_BASE = "https://www.workbuddy.ai"
@@ -213,13 +215,17 @@ def billing_headers(cred):
 
 
 def _post_json(url, headers, body="{}"):
+    """返回 (status, text)。网络层异常抛 RuntimeError。
+
+    BUGS-v2.63-288 P3：出站统一走 netguard.open_checked()（目标校验 + 逐跳重定向
+    复检）。这里的 host 可能来自 `cred.domain` / 自定义 base，属于用户可控。
+    """
     data = body.encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            return r.status, r.read(20000).decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read(8000).decode("utf-8", "replace")
+        return netguard.open_checked(req, timeout=TIMEOUT, limit=20000)
+    except netguard.BlockedTarget as e:
+        raise RuntimeError("网络错误: %s" % e)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise RuntimeError(f"网络错误: {e}")
 

@@ -36,6 +36,8 @@ import re
 import urllib.error
 import urllib.request
 
+from . import netguard
+
 BASE_CN = "https://api.trae.cn"
 BASE_INTL = "https://api.trae.ai"
 STATUS_PATH = "/trae/api/v2/ug/checkin_credits/status"
@@ -89,13 +91,17 @@ def _post(url, headers, body=b"{}"):
 
     网络层异常（DNS 失败、超时、连接被重置）统一返回 status=0 且 text 以
     NETERR_PREFIX 开头，由调用方用 _is_net_error() 判定，避免异常抛穿 run()。
+
+    BUGS-v2.63-288 P3：出站统一走 netguard.open_checked()。这里的 url 可能来自
+    `cfg["host"]`（用户可填自定义 host），所以需要目标校验；以前直接 urlopen
+    会默认跟随 302，绕过 netguard 的逐跳复检。
     """
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            return r.status, r.read(20000).decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read(8000).decode("utf-8", "replace")
+        return netguard.open_checked(req, timeout=TIMEOUT, limit=20000)
+    except netguard.BlockedTarget as e:
+        # 目标被安全策略拒绝：当成明确的网络层失败上报，不要伪装成 HTTP 码。
+        return 0, NETERR_PREFIX + str(e)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return 0, NETERR_PREFIX + str(e)
 

@@ -77,7 +77,10 @@ class AutoCheckinService : Service() {
                 if (job != null) {
                     job?.cancel()   // job 的 finally 里完成释放锁 / 续排 / 收尾
                 } else {
-                    scheduleNext()
+                    // BUGS-v2.63-286 P3：ensureArmed 是普通函数（非 suspend），
+                    // 直接调即可，不要再起协程 —— 起协程会在 stopSelf() → scope.cancel()
+                    // 时把还没开始执行的那次续排静默取消。
+                    runCatching { AutoCheckinScheduler.ensureArmed(applicationContext, allowToday = false) }
                     finishRun()
                 }
             }
@@ -88,13 +91,15 @@ class AutoCheckinService : Service() {
                     else -> {
                         job = scope.launch {
                             holdWakeLock()
+                            // BUGS-v2.63-286 P2/P3：补签与续排以前各起一个 scope.launch，
+                            // 谁先跑不确定，而 arm() 都落在同一个 PendingIntent 上 ——
+                            // 补签后跑则明天的常规排期丢失，续排后跑则补签被顶成明天。
+                            // 现在改成 finally 里一次顺序执行、二选一，并整体包在
+                            // NonCancellable 里（finally 本身在 job 协程内，stopSelf()
+                            // 之后才可能 scope.cancel()，包住即可保证跑完再退出）。
+                            var needRetry = false
                             try {
-                                val needRetry = runAll()
-                                if (needRetry) {
-                                    // 前台服务里没法像 Worker 那样 return retry()，
-                                    // 直接把下一次闹钟排到 10 分钟后（最多一次，靠本地标记防连环）
-                                    scheduleRetryOnce()
-                                }
+                                needRetry = runAll()
                             } catch (e: CancellationException) {
                                 updateProgress("签到已取消")
                             } catch (e: Exception) {
@@ -102,7 +107,18 @@ class AutoCheckinService : Service() {
                                 updateProgress("签到异常：" + (e.message ?: e.javaClass.simpleName))
                             } finally {
                                 releaseWakeLock()
-                                scheduleNext()
+                                withContext(NonCancellable) {
+                                    val app = applicationContext
+                                    runCatching {
+                                        if (needRetry) {
+                                            // 前台服务里没法像 Worker 那样 return retry()，
+                                            // 直接把下一次闹钟排到 10 分钟后（最多一次，靠本地标记防连环）
+                                            AutoCheckinScheduler.scheduleRetryIn(app, 10)
+                                        } else {
+                                            AutoCheckinScheduler.ensureArmed(app, allowToday = false)
+                                        }
+                                    }
+                                }
                                 finishRun()
                             }
                         }
@@ -185,33 +201,16 @@ class AutoCheckinService : Service() {
         }
     }
 
-    /**
-     * 续排下一次闹钟。跑在进程级 scope（不随 Service 销毁而取消），
-     * NonCancellable 保证续排必然完成 —— 否则闹钟丢失，次日彻底不跑。
-     */
-    private fun scheduleNext() {
-        val app = applicationContext
-        scope.launch {
-            withContext(NonCancellable) {
-                runCatching { AutoCheckinScheduler.ensureArmed(app, allowToday = false) }
-            }
-        }
-    }
+    // BUGS-v2.63-286 P3：原来的 scheduleNext() / scheduleRetryOnce() 已删除。
+    // 它们是 `scope.launch { withContext(NonCancellable) { … } }`，两个 launch 在
+    // Dispatchers.Default 上无顺序保证，而 arm() 都落在同一个 PendingIntent 上 ——
+    // 谁后跑谁赢（补签被顶成明天，或明天的排期丢失）。而且 onDestroy 的
+    // scope.cancel() 会把「还在排队没开始执行」的那个 launch 直接取消，
+    // NonCancellable 只保护已经进入 withContext 的那一段 —— 旧注释声称
+    // 「NonCancellable 保证续排必然完成」并不成立。
+    // 现在统一在 onStartCommand 的 finally 里一次顺序执行、二选一。
 
-    /**
-     * 网络类失败后的「补一次」：把下一次闹钟提前到 10 分钟后。
-     * 用本地标记限制只补一次，避免上游一直 5xx 时变成每 10 分钟打一次。
-     */
-    private fun scheduleRetryOnce() {
-        val app = applicationContext
-        scope.launch {
-            withContext(NonCancellable) {
-                runCatching { AutoCheckinScheduler.scheduleRetryIn(app, 10) }
-            }
-        }
-    }
-
-    /** 收尾：撤销前台 + 停止服务（闹钟续排由 scheduleNext 独立完成）。 */
+    /** 收尾：撤销前台 + 停止服务（闹钟续排已在 finally 里同步完成）。 */
     private fun finishRun() {
         try {
             if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE)

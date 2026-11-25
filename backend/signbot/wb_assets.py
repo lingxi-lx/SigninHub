@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+from . import netguard
 from . import workbuddy as wb
 
 TZ = timezone(timedelta(hours=8))
@@ -49,15 +50,20 @@ def _hdrs(cred):
 
 
 def _post(url, headers, body: dict):
+    """返回 (status, text)。
+
+    BUGS-v2.63-288 P3：出站统一走 netguard.open_checked()（目标校验 + 逐跳重定向
+    复检），不再直接 urlopen。
+
+    `limit=0` 表示不限读取长度 —— 这里不能截断：包多时响应会超过 50KB
+    （实测 50 个赠送包 ≈ 90KB），截断后 json.loads 会失败，被误判成「接口异常」。
+    """
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            # 不能截断：包多时响应会超过 50KB（实测 50 个赠送包 ≈ 90KB），
-            # 截断后 json.loads 会失败，被误判成「接口异常」。
-            return r.status, r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
+        return netguard.open_checked(req, timeout=TIMEOUT, limit=0)
+    except netguard.BlockedTarget as e:
+        raise RuntimeError("网络错误: %s" % e)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise RuntimeError("网络错误: %s" % e)
 

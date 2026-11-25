@@ -69,6 +69,44 @@ class LoginWebActivity : Activity() {
          * 所以这个 provider 的「登录流程」= 打开 chat/home 让用户登录 + 等会话落全 + 采集。
          */
         const val P_HW = "huawei"
+        /**
+         * 豆包（www.doubao.com）。
+         *
+         * 与华为码道同类：没有 token 可抓，鉴权就是**整串 Cookie**
+         * （`sessionid` / `sid_tt` / `uid_tt` / `sid_guard` 里至少一个，
+         *  其中 `sessionid` 是 HttpOnly，页面 JS 读不到，但 `CookieManager.getCookie()`
+         *  走引擎层能读到）。
+         *
+         * 与其他几家的关键区别：**不需要算 a_bogus 签名**。实测服务端先查登录态、
+         * 签名不参与前置校验，所以拿到 Cookie 后纯 OkHttp 直打就行，不碰 WebView。
+         * 详见 `DoubaoWebCheckin.kt` 类注释。
+         */
+        const val P_DB = "doubao"
+        /**
+         * 智谱清言（chatglm.cn）。
+         *
+         * 与豆包/华为同类：鉴权就是**整串 Cookie**（`chatglm_token` + `chatglm_refresh_token`），
+         * 页面 JS 也能读到（这两个不是 HttpOnly），但走 `CookieManager` 更省事。
+         *
+         * **判据必须看 JWT 里的 `is_guest`，不能只看有没有 `chatglm_token`**：
+         * 未登录游客也会拿到一整套 token（421 B + 423 B），只判存在会把游客当已登录
+         * （zaoba 项目 `src/login-one.js:30-34` 记录过同一个坑：一打开就判成功、4 秒后自动关窗，
+         *  用户来不及扫码）。判据收在 `ZhipuCheckin.hasSession()`。
+         *
+         * 签到不需要 WebView：`X-Sign` 能本地算（md5 + 时间戳校验位改写），见 `ZhipuCheckin`。
+         */
+        const val P_ZP = "zhipu"
+        /**
+         * 百度千帆 / 百度搭子 DuMate（console.bce.baidu.com）。
+         *
+         * 鉴权同样是整串 Cookie，关键是 `BDUSS`（登录态）与 `bce-user-info`（CSRF 令牌）。
+         * 游客态这两个都没有 —— 实测游客只有 `BAIDUID` / `HMACCOUNT` / `ppfuid` / `CASSSID` 等
+         * 十几个无关 cookie，所以「两个都在」就是可靠判据。
+         *
+         * 登录页会 302 到 `login.bce.baidu.com`（WAP 版），手机 UA 下能正常走
+         * 「百度账号 / 发送验证码 / 百度APP一键登录」流程。
+         */
+        const val P_QF = "qianfan"
 
         // 顶栏胶囊按钮配色（与 SignDialog / 主界面同一套）：
         //   BRAND→BRAND2 渐变是主操作，「确认」用它；
@@ -84,6 +122,17 @@ class LoginWebActivity : Activity() {
         private const val QD_OPENAPI_BASE = "https://openapi.qoder.com.cn"
         private const val QD_VERIFIER_CHARS =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+
+        /**
+         * 豆包采集探测的三态结论（V2.72）。
+         *
+         * 为什么要有 [DB_UNKNOWN] 这一态：刚登录成功时页面 SDK 可能还没装好，
+         * 页面内 fetch 会失败。把「判断不了」当成「未登录」会把用户刚拿到的有效登录态清掉，
+         * 所以必须与「确定未登录」分开 —— 这与项目里「凭据判断不了必须与否分开」是同一条铁律。
+         */
+        private const val DB_YES = 1
+        private const val DB_NO = 0
+        private const val DB_UNKNOWN = -1
     }
 
     private lateinit var provider: String
@@ -141,6 +190,10 @@ class LoginWebActivity : Activity() {
     @Volatile
     private var hwBusy = false
 
+    /** 豆包：是否正在采集（与 hwBusy 同理，避免「再采一次」被 saved 永久挡住）。 */
+    @Volatile
+    private var dbBusy = false
+
     /**
      * 华为：历史遗留的门户采集标记。
      *
@@ -194,6 +247,13 @@ class LoginWebActivity : Activity() {
             P_MM -> listOf("minimax.cn", "minimaxi.com")
             P_QD -> listOf("qoder.cn", "qoder.com", "qoder.sh")
             P_HW -> listOf("huaweicloud.com", "codearts.huaweicloud.com")
+            P_DB -> listOf("doubao.com")
+            // 智谱清言：登录、会员中心、SSO 回跳都在 chatglm.cn 下（含 bigmodel.cn 的跳转中转）
+            P_ZP -> listOf("chatglm.cn", "bigmodel.cn")
+            // 百度：登录页在 login.bce.baidu.com，账号体系走 passport.baidu.com，
+            // 业务域是 console.bce.baidu.com —— 三者必须都在白名单里，否则登录成功后
+            // 回跳那一刻会被判成「不在域内」，采集直接放弃。
+            P_QF -> listOf("bce.baidu.com", "baidu.com", "passport.baidu.com")
             else -> emptyList()
         }
         return allowed.any { host == it || host.endsWith("." + it) }
@@ -226,6 +286,9 @@ class LoginWebActivity : Activity() {
                 P_QD -> "在下方网页登录 Qoder，登录后自动取回 token"
                 P_WB_AI -> "登录 WorkBuddy 国际版（workbuddy.ai）；登录后自动保存"
                 P_HW -> "在下方登录华为码道（devcloud），回到 chat/home 后自动采集 Cookie"
+                P_DB -> "在下方登录豆包（www.doubao.com），登录后自动采集 Cookie"
+                P_ZP -> "在下方登录智谱清言（chatglm.cn），登录后自动采集 Cookie"
+                P_QF -> "在下方登录百度智能云（登录后回到 console.bce.baidu.com），自动采集 Cookie"
                 else -> "登录后自动读取凭据"
             }
             setTextColor(Color.parseColor("#E6EAF2"))
@@ -319,6 +382,10 @@ class LoginWebActivity : Activity() {
             // 阿里云 SSO 会从 account.aliyun.com 弹新窗口做登录，不放开会白屏
             javaScriptCanOpenWindowsAutomatically = true
             setSupportMultipleWindows(true)
+            // 所有 provider 共用手机 UA。**豆包尤其不能改成桌面 UA**（V2.68 实测）：
+            // 桌面 UA 打开 doubao.com 会把「登录」入口整个隐藏，只剩游客态；
+            // 手机 UA 下 `/chat/` 右上角才有「登录」胶囊。别为「看起来像电脑版」
+            // 去伪装 SamanthaDoubao，那条路只会让登录入口消失。
             userAgentString =
                 "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) " +
                     "Chrome/120.0.0.0 Mobile Safari/537.36"
@@ -355,6 +422,22 @@ class LoginWebActivity : Activity() {
             fun onMmToken(json: String) {
                 if (!isTrustedOrigin()) return
                 ui { handleMmToken(json) }
+            }
+
+            /**
+             * 豆包采集探测的回抛口（V2.72）。
+             *
+             * 页面里 `fetch('/alice/ug/campaign/landing/get')` 的结果经这里回来，
+             * 由 [dbProbeVerdict] 判断服务端认不认这份 Cookie。
+             * 同样过 `isTrustedOrigin()` 闸 —— 桥对整个 WebView 生效，
+             * 页面被导航到第三方域后仍能调进来。
+             */
+            @JavascriptInterface
+            fun onDbProbe(text: String) {
+                if (!isTrustedOrigin()) return
+                val cb = dbProbeCb ?: return
+                dbProbeCb = null
+                ui { cb(dbProbeVerdict(text)) }
             }
 
             /**
@@ -431,6 +514,21 @@ class LoginWebActivity : Activity() {
                         view?.evaluateJavascript(mmJs(), null)
                     }
                 }
+                // 豆包与华为同类：登录态就是整串 Cookie，没有 token 可抓。
+                // 采集阶段不需要真打接口验一次 —— Cookie 里有没有 sessionid 就足够判定。
+                // （注意：签到阶段纯 HTTP 打不通，签名由页面里的 SDK 在 fetch 层注入，
+                //  所以签到走 DoubaoWebCheckin 的 WebView 方案；采集阶段不受影响。）
+                // 这里只在 URL 回到 doubao.com 业务页时才采集，避免登录页中间态误存。
+                if (provider == P_DB && !saved && url != null) {
+                    dbCapture(false)
+                }
+                // 智谱 / 百度：同样只在页面加载完成时采一次，采到就停（saved 挡住重复）。
+                if (provider == P_ZP && !saved && url != null) {
+                    zpCapture(false)
+                }
+                if (provider == P_QF && !saved && url != null) {
+                    qfCapture(false)
+                }
             }
         }
 
@@ -505,10 +603,347 @@ class LoginWebActivity : Activity() {
             qoderOauthFlow()
         } else if (provider == P_HW) {
             hwFlow()
+        } else if (provider == P_DB) {
+            dbFlow()
+        } else if (provider == P_ZP) {
+            zpFlow()
+        } else if (provider == P_QF) {
+            qfFlow()
         } else {
             // P_WB 与 P_WB_AI 共用一条流程，区域由 [wbVariant] 决定
             wbOauthFlow()
         }
+    }
+
+    // ── 豆包：站内登录 + Cookie 采集 ──────────────────────────────
+
+    private val DB_HOME_URL = "https://www.doubao.com/chat/"
+
+    /**
+     * 打开豆包对话页让用户登录。
+     *
+     * 为什么是 `/chat/` 而不是 `pc/agent-explore`（V2.68 更正）：
+     *   · V2.66 开的是 `pc/agent-explore`，实测在手机 UA 下直接渲染成
+     *     「该活动仅支持在豆包电脑版参与」+「去下载」引导页，**没有任何登录入口**；
+     *   · `/chat/` 在手机 UA 下右上角有「登录」胶囊，点开是
+     *     「使用豆包或飞书账号登录 / 手机号登录 / 飞书一键登录 / 抖音一键登录 / 二维码」，
+     *     登录成功后自动回跳，Cookie 就落下来了；
+     *   · 反过来，桌面 UA（含 `SamanthaDoubao`）打开 `/chat/` 会把登录入口整个隐藏
+     *     （DOM 里连「登录」两个字都没有），所以**必须用手机 UA + `/chat/`**。
+     * 登录成功后用户再回首页点「签到」，签到走的是纯 HTTP，与页面无关。
+     */
+    private fun dbFlow() {
+        status.text = "在下方登录豆包：点右上角「登录」，用手机号或扫码登录，成功后会自动采集 Cookie"
+        web.loadUrl(DB_HOME_URL)
+    }
+
+    /**
+     * 采集豆包 Cookie。
+     *
+     * 判据演进（每次都是被真实 bug 逼出来的，别往回退）：
+     *   · V2.66：只看 Cookie 里有没有 `sessionid` 这些**名字** —— 过期会话的名字也还在，
+     *     于是把上一次的死会话存进去（用户 m03836）。
+     *   · V2.71：改成问页面「登录弹窗在不在」—— 但页面已经是正常对话页、弹窗早关了，
+     *     右上角却还挂着「登录」黑胶囊，判据答「没弹窗」= 登录了（用户 m03980）。
+     *   · V2.72：同时看三样 —— 弹窗在不在、右上角有没有「登录」胶囊、页面内真打一次
+     *     `landing/get` 看服务端裁决。任一命中「未登录」就不存。
+     *
+     * 采集成功也**不关窗**（华为那条 m20782 的教训），顶栏文案改成「已采集」。
+     */
+    private fun dbCapture(auto: Boolean) {
+        if (dbBusy) return
+        val u = currentUrl
+        if (u.isBlank() || !isTrustedUrl(u)) {
+            if (!auto) status.text = "当前页面不在豆包域内，请先打开豆包活动页"
+            return
+        }
+        val isLoginPage = u.contains("/login") || u.contains("sso") || u.contains("passport")
+        if (isLoginPage) {
+            if (!auto) status.text = "还在登录页，请先完成登录"
+            return
+        }
+        val ck = try { CookieManager.getInstance().getCookie(DB_HOME_URL) } catch (e: Exception) { null }
+        if (ck.isNullOrBlank() || !DoubaoWebCheckin.hasSession(ck)) {
+            if (!auto) status.text = "还没登录豆包：点页面右上角「登录」，登录成功后再点「确认」"
+            return
+        }
+        // 光看 Cookie 里有 sessionid 不够：过期会话的名字也还在（用户 m03836 的 bug ——
+        // 登录弹窗还开着，界面已经显示「已采集 2716 字符」，存进去的是上一次的死会话）。
+        // 也不能只看登录弹窗在不在（用户 m03980 的 bug —— 页面已经是正常对话页、弹窗没了，
+        // 右上角却还挂着「登录」黑胶囊，说明这份 Cookie 根本没登录）。
+        // 唯一可靠的判据：同时看 DOM 两处证据 + 页面内真打一次 landing/get 看服务端裁决。
+        dbBusy = true
+        // 闸门兜底：回调在极端情况下（WebView 正在销毁）不回来，那样 dbBusy 会永久 true，
+        // 之后所有采集都被自己挡住。探测自身有 12 秒超时，这里再兜一层。
+        web.postDelayed({ dbBusy = false }, 14000)
+        dbLoggedInProbe { verdict ->
+            dbBusy = false
+            if (verdict == DB_YES) {
+                val cookie = try {
+                    CookieManager.getInstance().getCookie("https://www.doubao.com") ?: ck
+                } catch (e: Exception) { ck }
+                persistDb(cookie, auto)
+                return@dbLoggedInProbe
+            }
+            if (verdict == DB_UNKNOWN) {
+                // 判断不了（页面内请求没回来）。这时**既不清也不存** —— 刚登录成功时
+                // SDK 可能还没装好，把「判断不了」当「未登录」会清掉用户刚拿到的有效登录态。
+                if (!auto) status.text = "暂时判断不了登录状态（页面内请求没返回），请稍等再点「确认」"
+                return@dbLoggedInProbe
+            }
+            // 确定没登录。如果 Cookie 里还留着 session 键，说明是上一次的死会话 —— 清掉，
+            // 否则每次进页面都会被它骗一次。
+            if (DoubaoWebCheckin.hasSession(ck)) {
+                dbClearCookies()
+                saved = false
+                status.text = "检测到旧的登录态已失效（Cookie 里有 sessionid 但服务端不认），" +
+                    "已清除，请在下方重新登录"
+                // 清完再刷一次页面：否则页面上残留的还是旧会话渲染出来的界面，
+                // 用户看到的与刚清掉的状态不一致。刷新后 cookie 里没有 session 键，
+                // dbCapture 会走「还没读到会话 Cookie」那条早返，不会来回刷。
+                web.postDelayed({ try { web.loadUrl(DB_HOME_URL) } catch (_: Exception) {} }, 400)
+            } else if (!auto) {
+                status.text = "还没登录豆包：点页面右上角「登录」，登录成功后再点「确认」"
+            }
+        }
+    }
+
+    /** 页面里那次登录态探测的回调；同一时刻只允许一个。 */
+    @Volatile
+    private var dbProbeCb: ((Int) -> Unit)? = null
+
+    /**
+     * 判断「这份 Cookie 现在到底登录着没有」（V2.72）。
+     *
+     * 三次都判错过，所以这次同时看三样：
+     *   1. 登录弹窗在不在（V2.71 只用这个 —— 用户 m03980 的 bug 是弹窗没了但没登录）；
+     *   2. 页面右上角还有没有「登录」胶囊（用户截图 m03980 里它就在那儿，这是最直接的证据）；
+     *   3. 页面内真打一次 `landing/get`，拿服务端的错误码当参考。
+     *
+     * 判定顺序：1 或 2 命中 → 确定未登录；否则看错误码 —— `710012001` = 未登录，
+     * `0` / `710010702` / `710010202` = 已登录（会话有效，只是可能没活动）；
+     * 请求本身失败（-1 / -2）→ 判断不了，**不清 Cookie 也不存**，让用户点「确认」重试。
+     * 这一条很重要：刚登录成功时 SDK 可能还没装好，把「判断不了」当成「未登录」
+     * 会把用户刚拿到的有效登录态清掉。
+     *
+     * 只读请求，不改服务端状态。
+     */
+    private fun dbLoggedInProbe(cb: (Int) -> Unit) {
+        dbProbeCb = cb
+        // 不设任何 X-* 头，免得与页面 SDK 的签名逻辑打架；Content-Type 必须显式给。
+        val js = "(function(){" +
+            "var out={modal:false,loginBtn:false,code:-1};" +
+            "var t=(document.body&&document.body.innerText)||'';" +
+            "var keys=['使用豆包或飞书账号登录','飞书一键登录','抖音一键登录','请输入手机号'];" +
+            "for(var i=0;i<keys.length;i++){if(t.indexOf(keys[i])>=0){out.modal=true;break;}}" +
+            "var els=document.querySelectorAll('button,a,div,span');" +
+            "for(var j=0;j<els.length;j++){var e=els[j];" +
+            "if(e.children&&e.children.length>0)continue;" +
+            "var s=(e.innerText||'').trim();" +
+            "if(s!=='登录'&&s!=='登录/注册'&&s!=='立即登录')continue;" +
+            "var r=e.getBoundingClientRect();" +
+            "if(r.width<=2||r.height<=2)continue;" +
+            "if(r.top<0||r.top>160)continue;" +
+            "if(r.left<window.innerWidth*0.5)continue;" +
+            "out.loginBtn=true;break;}" +
+            "fetch('/alice/ug/campaign/landing/get',{method:'POST',credentials:'include'," +
+            "headers:{'Content-Type':'application/json'}," +
+            "body:JSON.stringify({badge_counts:{incentive:1}})})" +
+            ".then(function(r){return r.text();})" +
+            ".then(function(tx){try{out.code=(JSON.parse(tx)||{}).code||-1;}catch(e){out.code=-1;}" +
+            "SignHubLogin.onDbProbe(JSON.stringify(out));})" +
+            ".catch(function(){out.code=-2;SignHubLogin.onDbProbe(JSON.stringify(out));});" +
+            "})()"
+        try {
+            web.evaluateJavascript(js, null)
+        } catch (e: Exception) {
+            dbProbeCb = null
+            cb(DB_UNKNOWN)
+            return
+        }
+        web.postDelayed({
+            val p = dbProbeCb
+            if (p != null) {
+                dbProbeCb = null
+                p(DB_UNKNOWN)
+            }
+        }, 12000)
+    }
+
+    /** 解析探测结果，返回 [DB_YES] / [DB_NO] / [DB_UNKNOWN]。 */
+    private fun dbProbeVerdict(text: String): Int {
+        if (text.isBlank()) return DB_UNKNOWN
+        val o = try { JSONObject(text) } catch (_: Exception) { return DB_UNKNOWN }
+        if (o.optBoolean("modal", false)) return DB_NO
+        if (o.optBoolean("loginBtn", false)) return DB_NO
+        val code = o.optInt("code", -1)
+        if (code == -2 || code == -1) return DB_UNKNOWN
+        return if (code == 710012001) DB_NO else DB_YES
+    }
+
+    /**
+     * 清掉豆包域的 Cookie。
+     *
+     * 为什么要按名字逐个清：`removeAllCookies` 会把所有站点一起清掉（这个 WebView
+     * 是所有 provider 共用的），虽然当前流程只服务豆包，但逐个清更精准、也不影响
+     * 其它已登录站点留在本 WebView 里的状态。
+     */
+    private fun dbClearCookies() {
+        val cm = CookieManager.getInstance()
+        val names = try { cm.getCookie("https://www.doubao.com") } catch (e: Exception) { null }
+            ?.split(";")
+            ?.mapNotNull { it.substringBefore("=").trim().takeIf { n -> n.isNotEmpty() } }
+            ?: emptyList()
+        for (n in names) {
+            cm.setCookie("https://www.doubao.com", "$n=; Max-Age=0; Path=/")
+            cm.setCookie("https://www.doubao.com/chat/", "$n=; Max-Age=0; Path=/")
+        }
+        cm.flush()
+    }
+
+    /**
+     * 落库豆包 Cookie。
+     *
+     * 采集成功也**不关窗**（华为那条 m20782 的教训）：用户可能还要切账号或核对活动状态。
+     * 顶栏文案改成「已采集」，让「窗口没消失」这件事有明确解释。
+     */
+    private fun persistDb(cookie: String, auto: Boolean) {
+        val ok = saveBlocking { cur -> cur.copy(dbCookie = cookie) }
+        if (!ok) {
+            status.text = "保存失败：本机存储不可写"
+            return
+        }
+        saved = true
+        status.text = "已采集豆包 Cookie（${cookie.length} 字符），可点右上角关闭"
+    }
+
+    // ── 智谱清言：站内登录 + Cookie 采集 ──────────────────────────────
+
+    private val ZP_HOME_URL = "https://chatglm.cn/main/alltoolsdetail"
+
+    /**
+     * 打开智谱清言主页让用户登录。
+     *
+     * 为什么是 `/main/alltoolsdetail` 而不是首页：首页在游客态会挂一整屏拉新文案
+     * （「新脑子到岗」「登录送积分好礼」），登录入口在右上角小字里，用户容易找不到。
+     * 工具详情页同样是游客可看，但顶部导航固定有「登录」按钮，登录成功后原地刷新，
+     * Cookie 直接落下来，不需要回跳。
+     */
+    private fun zpFlow() {
+        status.text = "在下方登录智谱清言：点右上角「登录」，用手机号或扫码登录，成功后自动采集 Cookie"
+        web.loadUrl(ZP_HOME_URL)
+    }
+
+    /**
+     * 采集智谱 Cookie。
+     *
+     * 判据只有一条但很关键：`ZhipuCheckin.hasSession()` —— 它同时要求
+     * ① `chatglm_refresh_token` 存在；② JWT 里 `is_guest != true`。
+     *
+     * 为什么不能只看「有没有 chatglm_token」：**未登录游客也有一整套 token**。
+     * 只看存在性会导致一进页面就判成功、把游客态存下来，之后签到必然 401 40103
+     * （zaoba 项目在 `src/login-one.js:30-34` 记录过完全一样的坑）。
+     */
+    private fun zpCapture(auto: Boolean) {
+        val u = currentUrl
+        if (u.isBlank() || !isTrustedUrl(u)) {
+            if (!auto) status.text = "当前页面不在智谱域内，请先打开 chatglm.cn"
+            return
+        }
+        if (u.contains("/login") || u.contains("sso") || u.contains("passport")) {
+            if (!auto) status.text = "还在登录页，请先完成登录"
+            return
+        }
+        val ck = try { CookieManager.getInstance().getCookie("https://chatglm.cn") } catch (e: Exception) { null }
+        if (ck.isNullOrBlank() || !ZhipuCheckin.hasSession(ck)) {
+            if (!auto) {
+                status.text = if (ck.isNullOrBlank())
+                    "还没读到智谱 Cookie：点页面右上角「登录」，登录成功后再点「确认」"
+                else
+                    "这份 Cookie 是游客态（JWT 里 is_guest=true）：游客也有一套完整 token，" +
+                        "请真的登录一次再点「确认」"
+            }
+            return
+        }
+        persistZp(ck)
+    }
+
+    /** 落库智谱 Cookie。与豆包/华为同理：采集成功也**不关窗**。 */
+    private fun persistZp(cookie: String) {
+        val ok = saveBlocking { cur ->
+            cur.copy(
+                zpCookie = cookie,
+                // 设备号从 JWT 解出来存一份：服务端只认 token 里的 device_id，
+                // 存下来是为了下次 refresh 时头组里的 X-Device-Id 与 token 一致。
+                zpDeviceId = ZhipuCheckin.deviceIdOf(cookie, ""),
+            )
+        }
+        if (!ok) {
+            status.text = "保存失败：本机存储不可写"
+            return
+        }
+        saved = true
+        val uid = ZhipuCheckin.uidOf(cookie)
+        status.text = "已采集智谱 Cookie（${cookie.length} 字符" +
+            (if (uid.isNotBlank()) "，uid ${uid.take(8)}…" else "") + "），可点右上角关闭"
+    }
+
+    // ── 百度千帆 / 百度搭子：站内登录 + Cookie 采集 ───────────────────
+
+    private val QF_HOME_URL = "https://console.bce.baidu.com/ai/#/ai/qianfan/overview"
+
+    /**
+     * 打开百度智能云千帆控制台让用户登录。
+     *
+     * 未登录会 302 到 `login.bce.baidu.com`（WAP 版，实测手机 UA 下可正常走
+     * 「百度账号 / 发送验证码 / 百度APP一键登录」），登录成功后自动回跳控制台。
+     * 选千帆概览页而不是首页：首页有多个产品宫格，回跳后当前 URL 仍属 console 域，
+     * 采集判据只需看域，与具体路径无关。
+     */
+    private fun qfFlow() {
+        status.text = "在下方登录百度智能云：登录成功后会自动回到控制台并采集 Cookie"
+        web.loadUrl(QF_HOME_URL)
+    }
+
+    /**
+     * 采集百度 Cookie。
+     *
+     * 判据：`DumateCheckin.hasSession()` = `BDUSS` 与 `bce-user-info` **同时**存在。
+     * 游客态实测有十几个无关 cookie（`BAIDUID` / `HMACCOUNT` / `ppfuid` / `CASSSID` …）
+     * 但这两个一个都没有，所以「两个都在」是可靠判据。
+     *
+     * 采集域必须用 `https://console.bce.baidu.com`：`CookieManager.getCookie(url)`
+     * 只返回对该 URL 生效的 cookie，用登录页 URL 去取会拿到一堆 login 域的中间态。
+     */
+    private fun qfCapture(auto: Boolean) {
+        val u = currentUrl
+        if (u.isBlank() || !isTrustedUrl(u)) {
+            if (!auto) status.text = "当前页面不在百度域内，请先打开百度智能云控制台"
+            return
+        }
+        val ck = try { CookieManager.getInstance().getCookie("https://console.bce.baidu.com") } catch (e: Exception) { null }
+        if (ck.isNullOrBlank() || !DumateCheckin.hasSession(ck)) {
+            if (!auto) {
+                val onLogin = u.contains("login.bce.baidu.com") || u.contains("passport.baidu.com")
+                status.text = if (onLogin)
+                    "还在百度登录页，请先完成登录（登录成功会自动回跳控制台）"
+                else
+                    "Cookie 里没有 BDUSS / bce-user-info：还没登录，请在下方完成登录后再点「确认」"
+            }
+            return
+        }
+        persistQf(ck)
+    }
+
+    /** 落库百度 Cookie。同样不关窗。 */
+    private fun persistQf(cookie: String) {
+        val ok = saveBlocking { cur -> cur.copy(qfCookie = cookie) }
+        if (!ok) {
+            status.text = "保存失败：本机存储不可写"
+            return
+        }
+        saved = true
+        status.text = "已采集百度智能云 Cookie（${cookie.length} 字符），可点右上角关闭"
     }
 
     // ── 华为码道：站内登录 + Cookie 采集 ──────────────────────────────
@@ -669,6 +1104,23 @@ class LoginWebActivity : Activity() {
         }.start()
     }
 
+    /**
+     * 读 auth 域（`auth.huaweicloud.com`）的 Cookie —— **静默重登的钥匙**（V2.79）。
+     *
+     * 为什么必须单独采集：devcloud 域的 `SESSION_ID` 是 Session 级、静置 30~60 分钟
+     * 就失效（实测见 `HwRenew` 类文档），而真正能自动换回新会话的是 auth 域那份
+     * 登录凭据。以前只 `getCookie(HW_HOME_URL)`，auth 域从来没读过，等于把长期
+     * 凭据白放着，每次失效都只能让用户重新输手机号。
+     *
+     * 用户点「登录华为码道」时 WebView 必然经过 `auth.huaweicloud.com/authui/login`，
+     * 所以那一刻这个域一定有 cookie。取不到返回空串（`HwRenew` 会据此直接跳过重登）。
+     */
+    private fun hwAuthCookieNow(): String = try {
+        CookieManager.getInstance().getCookie("https://auth.huaweicloud.com") ?: ""
+    } catch (_: Exception) {
+        ""
+    }
+
     private fun persistHw(cookie: String, portal: String, auto: Boolean) {
         if (!LocalCheckin.hwHasSession(cookie)) {
             if (!auto) status.text = "Cookie 里没有 devclouddevuibjJ_SESSION_ID，可能还没登录完成"
@@ -677,6 +1129,8 @@ class LoginWebActivity : Activity() {
         // agencyID 是华为回主页后才补发的附属 cookie；缺了它说明会话还没落全，
         // 拿去签到会报「头组不完整」而不是 401，排查起来很绕。
         val hasAgency = cookie.contains("agencyID=")
+        // V2.79：auth 域 Cookie 一起存，供 HwRenew 静默重登用。
+        val authCk = hwAuthCookieNow()
 
         // 多账号通道（用户 m24258）：追加到列表，不覆盖设置页里的主账号。
         if (toList) {
@@ -685,6 +1139,7 @@ class LoginWebActivity : Activity() {
             val acc = HwAccount(
                 id = AccountIds.stable(HwAccount.identityOf(cookie)),
                 cookie = cookie,
+                authCookie = authCk,
             )
             val dup = HwAccountStore.all(this).any {
                 HwAccount.agencyOf(it.cookie).let { a -> a.isNotBlank() && a == HwAccount.agencyOf(cookie) } ||
@@ -718,6 +1173,7 @@ class LoginWebActivity : Activity() {
         val ok = saveBlocking { s ->
             s.copy(
                 hwCookie = cookie,
+                hwAuthCookie = if (authCk.isNotBlank()) authCk else s.hwAuthCookie,
                 hwPortalCookie = if (portalOk) portal else s.hwPortalCookie,
             )
         }
@@ -743,6 +1199,12 @@ class LoginWebActivity : Activity() {
                 "已采集华为码道 Cookie（含 agencyID），可以点「关闭」返回"
             } else {
                 "已采集 Cookie，但缺 agencyID —— 若签到提示头组不完整，请稍等几秒再点「确认」"
+            }
+            // V2.79：auth 域没读到就明确说出来 —— 静默重登（免手机号续期）依赖它，
+            // 缺了等于每次会话过期都得手动重登，用户有权知道。
+            if (authCk.isBlank()) {
+                status.text = status.text.toString() +
+                    "\n（没读到 auth.huaweicloud.com 的 Cookie：会话过期后无法自动续期）"
             }
         }
     }
@@ -1239,6 +1701,11 @@ class LoginWebActivity : Activity() {
         if (provider == P_QD) return
         // 华为靠原生 CookieManager 采集，网页里没有可 dump 的凭据
         if (provider == P_HW) return
+        // 豆包同理：整串 Cookie 由原生 CookieManager 采集
+        if (provider == P_DB) return
+        // 智谱 / 百度：整串 Cookie 由原生 CookieManager 采集，网页里没有可 dump 的凭据
+        if (provider == P_ZP) return
+        if (provider == P_QF) return
         if (provider != P_TRAE && provider != P_MM && !wbState.isNullOrBlank()) return
         // MiniMax 只在业务页扫：`onPageFinished` 会在授权页（account.minimax.cn）
         // 也触发一次，那一页的 localStorage 全是登录中间态，扫了就是误判（用户 m13107）。
@@ -1263,6 +1730,34 @@ class LoginWebActivity : Activity() {
             }
             status.text = "正在确认登录状态并采集 Cookie…"
             hwCapture(false)
+            return
+        }
+        if (provider == P_DB) {
+            // 豆包：点「确认」= 立刻采集一次 Cookie（不等页面再加载）
+            if (saved) {
+                status.text = "豆包 Cookie 已保存，可以点「关闭」返回"
+                return
+            }
+            status.text = "正在采集豆包 Cookie…"
+            dbCapture(false)
+            return
+        }
+        if (provider == P_ZP) {
+            if (saved) {
+                status.text = "智谱 Cookie 已保存，可以点「关闭」返回"
+                return
+            }
+            status.text = "正在确认登录状态并采集智谱 Cookie…"
+            zpCapture(false)
+            return
+        }
+        if (provider == P_QF) {
+            if (saved) {
+                status.text = "百度智能云 Cookie 已保存，可以点「关闭」返回"
+                return
+            }
+            status.text = "正在确认登录状态并采集百度 Cookie…"
+            qfCapture(false)
             return
         }
         if (provider != P_TRAE && provider != P_MM && !wbState.isNullOrBlank()) {
@@ -1489,6 +1984,32 @@ class LoginWebActivity : Activity() {
                 (tok.length >= 10 && tok == main.traeToken)
             if (sameAsMain) {
                 status.text = "页面进的还是主账号；请先退出登录，再用另一个 Trae 账号登录"
+                return
+            }
+            // V2.78（用户 m05383「主账号签不上、账号 2 能签」）：这里是同一个上游账号的**重新登录**。
+            //
+            // 以前只判 session/token 完全相同（上面那段），所以「同一个 Trae 号重新登录一次」——
+            // 换了新 token、新 session —— 会被当成一个新账号追加进列表，而主账号仍旧握着
+            // 那份早已失效的旧凭据。结果就是两张卡指着同一个上游号：主账号那张每次签到必然
+            // 失败（红叉），列表里那张成功（绿勾），余额还一模一样（都是同一个号的余额）。
+            //
+            // 判据用 JWT 里的 uid（sub）：同一个号重登会换 token + session，只有 uid 不变。
+            // uid 相同时**刷新主账号凭据**，不追加列表项。设备号沿用主账号已有的合法号
+            // （设备号必须永久稳定，换号等于换设备，会触发 9074 风控）。
+            val mainUid = if (main.traeToken.length >= 10) LocalCheckin.jwtUid(main.traeToken) else ""
+            val newUid = if (tok.length >= 10) LocalCheckin.jwtUid(tok) else ""
+            if (newUid.isNotBlank() && newUid == mainUid) {
+                saveBlocking { s ->
+                    s.copy(
+                        traeToken = if (tok.length >= 10) tok else s.traeToken,
+                        traeSession = if (sess.isNotBlank()) sess else s.traeSession,
+                        traeDeviceId = if (DeviceId.isValid(s.traeDeviceId)) s.traeDeviceId
+                        else traeDeviceFor(tok, sess),
+                    )
+                }
+                status.text = "这仍是主账号（uid $newUid）；已用它刚登录拿到的新凭据刷新主账号，未新增账号"
+                Toast.makeText(this, "已刷新主账号 Trae 凭据（同一个账号，未新增）", Toast.LENGTH_LONG).show()
+                saved = true; finish()
                 return
             }
             val acc = TraeAccount(
@@ -1910,6 +2431,21 @@ class LoginWebActivity : Activity() {
                     "抓法：浏览器登录 devcloud.cn-north-4.huaweicloud.com/chat/home → F12 → Network → " +
                     "任一带 PromptCenterService 的请求 → 复制请求头里的整条 Cookie。" +
                     "第二栏可填 codearts.huaweicloud.com 的 Cookie（只用于读积分余额，不填也能签到）。"
+            P_DB ->
+                "粘贴豆包网页版的整串 Cookie（必须含 sessionid）。" +
+                    "抓法：浏览器登录 www.doubao.com → F12 → Application → Cookies → " +
+                    "https://www.doubao.com → 全选复制成 name=value; name=value 形式。" +
+                    "也可以 F12 → Network → 任一带 sessionid 的请求 → 复制请求头里的整条 Cookie。"
+            P_ZP ->
+                "粘贴智谱清言（chatglm.cn）的整串 Cookie（必须含 chatglm_token 与 chatglm_refresh_token）。" +
+                    "抓法：浏览器登录 chatglm.cn → F12 → Application → Cookies → https://chatglm.cn → " +
+                    "全选复制成 name=value; name=value 形式。" +
+                    "注意：未登录游客也有一整套 token，粘进来会被判成游客态（JWT 里 is_guest=true），存不下。"
+            P_QF ->
+                "粘贴百度智能云的整串 Cookie（必须含 BDUSS 与 bce-user-info）。" +
+                    "抓法：浏览器登录 console.bce.baidu.com → F12 → Application → Cookies → " +
+                    "https://console.bce.baidu.com → 全选复制成 name=value; name=value 形式。" +
+                    "其中 bce-user-info 会同时作为 csrftoken 请求头发出去，缺它领取会被拒。"
             else ->
                 "粘贴 accessToken（WB 网页登录后 F12 里找 accessToken；第二栏可填 refreshToken 便于自动续期）"
         }
@@ -1918,13 +2454,20 @@ class LoginWebActivity : Activity() {
             P_MM -> "localStorage['_token'] 的值（无前缀）"
             P_QD -> "drt- 开头的 refreshToken（推荐）"
             P_HW -> "整串 Cookie（含 devclouddevuibjJ_SESSION_ID）"
+            P_DB -> "整串 Cookie（含 sessionid）"
+            P_ZP -> "整串 Cookie（含 chatglm_token）"
+            P_QF -> "整串 Cookie（含 BDUSS）"
             else -> "accessToken"
         }
         val h2 = if (provider == P_QD) "dt- 开头的 accessToken（可选，不填也行）"
                  else if (provider == P_HW) "codearts.huaweicloud.com 的 Cookie（可选，只读积分）"
                  else "refreshToken（可选）"
         val fields = mutableListOf(SignDialog.Field(h1, lastCandidate, multiline = true))
-        if (provider != P_TRAE && provider != P_MM) fields.add(SignDialog.Field(h2, multiline = true))
+        // 豆包 / 智谱 / 百度都只有一栏（整串 Cookie），第二栏无意义
+        if (provider != P_TRAE && provider != P_MM && provider != P_DB &&
+            provider != P_ZP && provider != P_QF) {
+            fields.add(SignDialog.Field(h2, multiline = true))
+        }
 
         SignDialog.input(
             this,
@@ -1961,6 +2504,47 @@ class LoginWebActivity : Activity() {
                 // 手动粘贴也走 probe 校验（BUGS-v2.41 P2-1）：华为对未登录访客也会发
                 // 匿名 J_SESSION_ID，只查 cookie 名会把匿名会话存成「已就绪」。
                 persistHwVerified(tok, second)
+            } else if (provider == P_DB) {
+                // 豆包不需要 probe：游客态一个 cookie 都拿不到（实测），
+                // 有 sessionid 就等于已登录。只在本地做一次格式检查。
+                val ck = tok.trim()
+                if (!DoubaoWebCheckin.hasSession(ck)) {
+                    Toast.makeText(
+                        this,
+                        "这段 Cookie 里没找到 sessionid / sid_tt / uid_tt / sid_guard，请重新复制整条 Cookie",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    persistDb(ck, auto = false)
+                    Toast.makeText(this, "已保存豆包 Cookie", Toast.LENGTH_SHORT).show()
+                }
+            } else if (provider == P_ZP) {
+                // 智谱：游客也有一整套 token，所以不能只判「有没有 chatglm_token」，
+                // 必须让 ZhipuCheckin.hasSession 去看 JWT 里的 is_guest。
+                val ck = tok.trim()
+                if (!ZhipuCheckin.hasSession(ck)) {
+                    Toast.makeText(
+                        this,
+                        "这段 Cookie 是游客态或缺少 chatglm_refresh_token：请先在 chatglm.cn 真的登录一次再复制",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    persistZp(ck)
+                    Toast.makeText(this, "已保存智谱 Cookie", Toast.LENGTH_SHORT).show()
+                }
+            } else if (provider == P_QF) {
+                // 百度：BDUSS 是登录态、bce-user-info 是 CSRF 令牌，缺任一个都不算登录
+                val ck = tok.trim()
+                if (!DumateCheckin.hasSession(ck)) {
+                    Toast.makeText(
+                        this,
+                        "这段 Cookie 里缺少 BDUSS 或 bce-user-info：还没登录，请重新复制整条 Cookie",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    persistQf(ck)
+                    Toast.makeText(this, "已保存百度智能云 Cookie", Toast.LENGTH_SHORT).show()
+                }
             } else {
                 saveWb(tok, second, null, null)
                 Toast.makeText(this, "已保存 WorkBuddy 凭据", Toast.LENGTH_SHORT).show()

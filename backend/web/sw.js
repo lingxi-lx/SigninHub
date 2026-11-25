@@ -1,9 +1,9 @@
 /* SigninHub Service Worker - 离线缓存壳（接口不缓存，静态资源网络优先、断网回退缓存） */
-const CACHE = "signhub-v262";
+const CACHE = "signhub-v291";
 const SHELL = [
   "/",
-  "/static/app.css?v=262",
-  "/static/app.js?v=262",
+  "/static/app.css?v=291",
+  "/static/app.js?v=291",
   "/manifest.webmanifest",
   "/static/icon-192.png",
   "/static/icon-512.png",

@@ -159,12 +159,16 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def open_checked(req: urllib.request.Request, timeout: float = 10.0,
-                 allow_private_http: bool = True):
+                 allow_private_http: bool = True, limit: int = 4000):
     """
     校验目标 → 发请求 → 手动跟随有限次重定向（每跳重新校验）。
 
     返回 `(status, body_text)`；HTTP 错误码也当正常返回（通知渠道用 body 里的
     业务码表达失败，见 notify._check_body），只有网络层异常才抛。
+
+    `limit` 是响应体最多读多少字节，默认 4000（通知渠道只需要前几 KB 判业务码）。
+    余额接口要读全（实测 50 个赠送包 ≈ 90KB，截断会让 json.loads 失败、被误判成
+    「接口异常」），调用方传 `limit=0` 表示不限。
     """
     url = req.full_url
     for _hop in range(MAX_REDIRECTS + 1):
@@ -175,11 +179,13 @@ def open_checked(req: urllib.request.Request, timeout: float = 10.0,
             )
         try:
             with _OPENER.open(req, timeout=timeout) as r:
-                return r.status, r.read(4000).decode("utf-8", "replace")
+                raw = r.read() if limit <= 0 else r.read(limit)
+                return r.status, raw.decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             loc = e.headers.get("Location") if e.headers else None
             if e.code in (301, 302, 303, 307, 308) and loc:
                 url = urllib.parse.urljoin(url, loc)
                 continue
-            return e.code, e.read(4000).decode("utf-8", "replace")
+            raw = e.read() if limit <= 0 else e.read(limit)
+            return e.code, raw.decode("utf-8", "replace")
     raise BlockedTarget("重定向次数过多（超过 %d 次）" % MAX_REDIRECTS)

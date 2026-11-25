@@ -18,6 +18,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from . import netguard
 from . import workbuddy as wb
 
 CHAT_BASE = "https://copilot.tencent.com"
@@ -93,14 +94,16 @@ def _req(method, url, cred, body=None, headers=None):
         if v:
             req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            return r.status, json.loads(r.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        t = e.read().decode("utf-8", "replace")
+        # BUGS-v2.63-288 P3：出站统一走 netguard.open_checked()（目标校验 + 逐跳
+        # 重定向复检）。limit=0 表示不限长度 —— 成长中心有些响应带完整任务列表，
+        # 截断会让 json.loads 失败、被当成接口异常。
+        status, text = netguard.open_checked(req, timeout=TIMEOUT, limit=0)
         try:
-            return e.code, json.loads(t)
+            return status, json.loads(text)
         except Exception:
-            return e.code, {"raw": t[:400]}
+            return status, {"raw": text[:400]}
+    except netguard.BlockedTarget as e:
+        return -1, {"err": repr(e)}
     except Exception as e:
         return -1, {"err": repr(e)}
 

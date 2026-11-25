@@ -219,7 +219,7 @@ DEFAULT_CONFIG = {
         #   协议：GET  /chat/PromptCenterService/v1/ops/delivery?channel=WEB
         #        POST /v1/ops/claim    {"campaignId":cid,"idempotentKey":"claim_<cid>_<ts>","channel":"WEB"}
         #        POST /v1/ops/confirm  {"campaignId":cid}   ← 少这步不算签完
-        #   鉴权：Cookie 含 devclouddevuibjJ_SESSION_ID；cftk 头取自 cookie devclouddevuibtcftk
+        #   鉴权：Cookie 含 devclouddevuibjJ_SESSION_ID；cftk 头取自 cookie devclouddevuibjtcftk
         #   余额：codearts.huaweicloud.com/portal/snap-manager/v1/package/overview（另一份 cookie）
         "huawei": {
             # enabled 恒 true（= 参不参与签到），凭据齐不齐由 readiness 的 ready 表达。

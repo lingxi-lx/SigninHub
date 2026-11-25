@@ -47,7 +47,49 @@ data class AppSettings(
     // 华为码道（DevCloud PromptCenter，站内登录后采集的整串 Cookie）
     // cookie 必填（含 devclouddevuibjJ_SESSION_ID）；portalCookie 只用于读积分余额。
     val hwCookie: String = "",
+    /**
+     * 华为 **auth 域**（`auth.huaweicloud.com`）的 Cookie（V2.79 加）。
+     *
+     * 这是「静默重登」的钥匙：devcloud 域的 `SESSION_ID` 是 Session 级、静置
+     * 30~60 分钟就失效，而 auth 域的登录凭据还在时，WebView 打开 `chat/home`
+     * 会自动 302 过去再回跳，下发一份**全新的** `SESSION_ID`，用户不用输手机号。
+     * 以前只采集 devcloud 域，auth 域从来没读过，所以这份长期凭据一直白放着。
+     *
+     * 判据见 `HwRenew`：为空则静默重登必然失败（登录页会停在输手机号那一步），
+     * 直接跳过那 18 秒。
+     */
+    val hwAuthCookie: String = "",
     val hwPortalCookie: String = "",
+
+    /**
+     * 豆包（www.doubao.com）网页登录后采集的整串 Cookie（V2.66 重新接入）。
+     *
+     * 判据是 `sessionid` / `sid_tt` / `uid_tt` / `sid_guard` 这一组；纯 OkHttp 直打
+     * `/alice/ug/campaign/landing/{get,checkin}`，不需要 a_bogus 签名。
+     * 详见 `DoubaoWebCheckin.kt` 的类注释与 `docs/DOUBAO.md`。
+     */
+    val dbCookie: String = "",
+    /** 上次探测成功的活动 scene，留空则按候选列表逐个试。 */
+    val dbScene: String = "",
+
+    /**
+     * 智谱清言（chatglm.cn）网页登录后采集的整串 Cookie（V2.76 接入）。
+     *
+     * 只用到里面两个：`chatglm_token`（约 24h）与 `chatglm_refresh_token`（约 50 天）。
+     * 签到走 `ZhipuCheckin` 纯 OkHttp（签名能本地算），不需要 WebView。
+     * **判据必须看 JWT 的 `is_guest`** —— 游客也有一套完整 token。
+     */
+    val zpCookie: String = "",
+    /** 设备号。留空则从 JWT 的 `device_id` 解，解不到按 uid 派生（实测不是硬校验）。 */
+    val zpDeviceId: String = "",
+
+    /**
+     * 百度智能云 / 百度搭子 DuMate（console.bce.baidu.com）采集的整串 Cookie（V2.76 接入）。
+     *
+     * 关键两个：`BDUSS`（登录票据）与 `bce-user-info`（控制台身份，同时是 CSRF 令牌来源）。
+     * 签到走 `DumateCheckin` 纯 OkHttp，接口是 `/api/dumate/points/{loginBonusInfo,loginBonus}`。
+     */
+    val qfCookie: String = "",
 
     /**
      * 有凭据字段解密失败（Keystore 密钥被清 / 换机还原 / 密文损坏）。
@@ -87,7 +129,13 @@ object SettingsStore {
     private val KEY_MM_UID = stringPreferencesKey("mm_uid")
     private val KEY_MM_DEVICE = stringPreferencesKey("mm_device")
     private val KEY_HW_COOKIE = stringPreferencesKey("hw_cookie")
+    private val KEY_HW_AUTH = stringPreferencesKey("hw_auth_cookie")
     private val KEY_HW_PORTAL = stringPreferencesKey("hw_portal_cookie")
+    private val KEY_DB_COOKIE = stringPreferencesKey("db_cookie")
+    private val KEY_DB_SCENE = stringPreferencesKey("db_scene")
+    private val KEY_ZP_COOKIE = stringPreferencesKey("zp_cookie")
+    private val KEY_ZP_DEVICE = stringPreferencesKey("zp_device")
+    private val KEY_QF_COOKIE = stringPreferencesKey("qf_cookie")
 
     /**
      * 读设置。
@@ -131,7 +179,13 @@ object SettingsStore {
             mmUserId = p[KEY_MM_UID] ?: "",
             mmDeviceId = p[KEY_MM_DEVICE] ?: "",
             hwCookie = d(p[KEY_HW_COOKIE] ?: ""),
+            hwAuthCookie = d(p[KEY_HW_AUTH] ?: ""),
             hwPortalCookie = d(p[KEY_HW_PORTAL] ?: ""),
+            dbCookie = d(p[KEY_DB_COOKIE] ?: ""),
+            dbScene = p[KEY_DB_SCENE] ?: "",
+            zpCookie = d(p[KEY_ZP_COOKIE] ?: ""),
+            zpDeviceId = p[KEY_ZP_DEVICE] ?: "",
+            qfCookie = d(p[KEY_QF_COOKIE] ?: ""),
             credsLost = lost,
         )
     }
@@ -164,6 +218,8 @@ object SettingsStore {
             p[KEY_QD_MACHINE] = s.qoderMachineId
             p[KEY_MM_UID] = s.mmUserId
             p[KEY_MM_DEVICE] = s.mmDeviceId
+            p[KEY_DB_SCENE] = s.dbScene
+            p[KEY_ZP_DEVICE] = s.zpDeviceId
 
             // 凭据字段：credsLost 时空值视为「读不出来」而不是「用户清空」，跳过不覆盖。
             // M3（BUGS-v2.61）：加密失败（Keystore 不可用）时也不写 —— encryptOrNull
@@ -185,7 +241,11 @@ object SettingsStore {
             putCred(KEY_QD_REFRESH, s.qoderRefresh)
             putCred(KEY_MM_TOKEN, s.mmToken)
             putCred(KEY_HW_COOKIE, s.hwCookie)
+            putCred(KEY_HW_AUTH, s.hwAuthCookie)
             putCred(KEY_HW_PORTAL, s.hwPortalCookie)
+            putCred(KEY_DB_COOKIE, s.dbCookie)
+            putCred(KEY_ZP_COOKIE, s.zpCookie)
+            putCred(KEY_QF_COOKIE, s.qfCookie)
         }
         if (cryptoFailed) {
             // M3：明确告知「这次没存进去」，而不是静默把明文写下去。

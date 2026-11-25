@@ -252,11 +252,70 @@ object HwCheckin {
      * P3-1（BUGS-v2.46）：早先有个 `reuse: CheckinResult? = null` 形参，5 个调用点
      * 全都没传 —— 死参数。删掉它，免得后来人以为存在「预置结果」这条通路。
      * 「刚签过别再打」由 `CheckinGate` 的复用表负责，「今天签过」由 [HwTodayMark] 负责。
+     *
+     * ## 静默重登（V2.79）
+     *
+     * 用户 m05846 要求「Cookie 不过期、自动续签」。华为没有 Trae 那种换发端点
+     * （实测见 [HwRenew] 的类文档），但 auth 域的长期凭据还在时，用一次不可见
+     * WebView 打开 `chat/home` 就能让它自己 302 往返、下发新 `SESSION_ID`。
+     *
+     * 触发条件**只限「明确判定为登录态问题」**：
+     *   · `authFailed == true`（`LocalCheckin.huawei` 的 401 / 空响应 / 非 JSON 三条路径
+     *     都会置它，不靠匹配中文文案 —— BUGS-v2.48 P2-2 的教训）；
+     *   · 或者 cookie 里压根没有会话名（`hwHasSession` 为假），此时本来就要重登。
+     *
+     * 不在这里判断「cookie 快过期」：华为的 SESSION_ID 没有 `Expires`（Session 级），
+     * 无从得知还剩多久，只能等它真的失效。网络错误（`authFailed == false` 且
+     * status 是 fail）**不触发重登** —— 判断不了不等于没登录。
+     *
+     * 重登成功后用新 Cookie 再签一次，并通过 [onRenewed] 让调用方落盘。
+     * 救不回来（auth 域也过期）就原样返回第一次的失败结果，绝不掩盖。
      */
     suspend fun run(
         ctx: Context,
         cookie: String,
         portalCookie: String = "",
+        authCookie: String = "",
+        onRenewed: ((HwRenew.Renewed) -> Unit)? = null,
+    ): CheckinResult {
+        val first = once(ctx, cookie, portalCookie)
+        // 已经签成了、或者只是网络错误 → 不重登
+        if (first.status == "success" || first.status == "already") return first
+        val needRenew = first.authFailed || !LocalCheckin.hwHasSession(cookie)
+        if (!needRenew) return first
+        val fresh = HwRenew.renew(ctx, cookie, authCookie, portalCookie) ?: return first
+        // 先落盘再重签：即使这一轮签到仍失败，新 Cookie 也是有效资产，
+        // 下次不必再花 18 秒走一遍 302。
+        runCatching { onRenewed?.invoke(fresh) }
+        // 新会话刚建立，旧的就绪结论必须清掉（按 identityOf 分桶，agencyID 未变 → 同一个桶），
+        // 否则 `HwVerified.usable()` 会拿旧 Cookie 的 false 压住新 Cookie，白跳过一轮。
+        //
+        // **`HwTodayMark` 不清，这是有意的**（BUGS-v2.63 P3-6 纠正了这里原先写错的注释）：
+        // 它只在 `success` / `already` 时写（见本函数下方），标记存在就代表「今天真的签成功过」，
+        // 与 Cookie 换没换无关。`once(fresh.cookie)` 命中它返回 already 正是正确语义
+        // —— 同一账号同一天只能签一次。反过来，如果照旧注释去清它，就等于把
+        // 「同账号同日只签一次」的保护拆掉，同一天会重复打上游。
+        HwVerified.clear(ctx, fresh.cookie)
+        val portal = fresh.portalCookie.ifBlank { portalCookie }
+        val second = once(ctx, fresh.cookie, portal)
+        // 新 Cookie 是「确实登录了」的强证据，无论签到结果如何都记 true：
+        // 否则下一轮 /api/status 还会把它当未就绪，白跳过。
+        HwVerified.set(ctx, fresh.cookie, true)
+        return if (second.status == "success" || second.status == "already") {
+            second.copy(message = second.message + "（已自动续期登录态）")
+        } else {
+            // 续期成功但签到仍失败：把真实原因带出去，别用第一次那条「登录已失效」误导用户。
+            second.copy(message = second.message + "（登录态已自动续期，但签到仍失败）")
+        }
+    }
+
+    /**
+     * 单次签到尝试（不含量重登）。原 [run] 的主体，抽出来供重登前后各调一次。
+     */
+    private suspend fun once(
+        ctx: Context,
+        cookie: String,
+        portalCookie: String,
     ): CheckinResult {
         if (!LocalCheckin.hwHasSession(cookie)) {
             return CheckinResult(

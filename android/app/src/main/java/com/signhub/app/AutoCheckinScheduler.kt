@@ -126,7 +126,12 @@ object AutoCheckinScheduler {
         val now = System.currentTimeMillis()
         if (c.retryAt > 0 && todayKey(c.retryAt) == todayKey(now)) return
         val at = now + minutes.coerceIn(1, 60) * 60_000L
-        LocalConfig.save(ctx, c.copy(retryAt = at))
+        // BUGS-v2.63-286 P2：`nextPick` 与 `retryAt` 必须同步写成同一个时刻。
+        // 以前只写 retryAt，nextPick 还停在「明天 08:30」，于是紧接着的续排
+        // （ensureArmedAt 走 allowToday=false 分支）拿 nextPick 覆盖掉补签闹钟
+        // —— 两个字段各说一套，谁后跑谁赢。写成同一个值以后，无论哪条路径
+        // 后执行，arm() 的目标都是 at。
+        LocalConfig.save(ctx, c.copy(retryAt = at, nextPick = at))
         arm(ctx, at)
     }
 
@@ -190,15 +195,29 @@ object AutoCheckinScheduler {
     private fun ensureArmedAt(ctx: Context, h: Int, m: Int, jitterMin: Int, allowToday: Boolean) {
         val c = LocalConfig.load(ctx)
         val now = System.currentTimeMillis()
-        val at: Long
-        if (allowToday && c.nextPick > now) {
-            at = c.nextPick
-        } else if (!allowToday && c.nextPick > now) {
-            // 续排场景：上次算出的时刻还没到，说明闹钟没被消费掉（重复投递），沿用
-            at = c.nextPick
+        // BUGS-v2.63-286 P2：续排（allowToday=false）必须先看有没有待执行的补签。
+        // 补签（scheduleRetryIn）与续排（ensureArmed）在 AutoCheckinService 里是两个
+        // 协程，谁先跑不确定；补签只把闹钟 arm 到 10 分钟后，如果续排后跑就会把它
+        // 顶成明天。这里让续排认出「今天还欠一次补签」并直接沿用它 —— 两条路径
+        // 谁先谁后都不丢。
+        if (!allowToday && c.retryAt > now && todayKey(c.retryAt) == todayKey(now)) {
+            arm(ctx, c.retryAt)
+            return
+        }
+        // BUGS-v2.63 P3-4：以前这里写成 if (allowToday && …) / else if (!allowToday && …) 两支，
+        // 两支的函数体一模一样（都 `at = c.nextPick`），allowToday 对最终闹钟时刻零影响，
+        // 而注释却声称「false = 必须排到严格未来的那一次」。合并成一支，并让 allowToday
+        // 真的起作用：false（签到执行完后的续排）时，即使 nextPick 在未来也重抽一次，
+        // 否则「刚跑完这一轮」会把下一次排在几秒后（那个 nextPick 就是刚被消费掉的那个时刻）。
+        val at: Long = if (allowToday && c.nextPick > now) {
+            // 开机 / 打开 App / 改配置：已排时刻还在未来就沿用（同一 PendingIntent 再注册
+            // 等价于覆盖，等于没变），避免反复重抽把「今天还没跑」的那次顶成明天。
+            c.nextPick
         } else {
-            at = pickAt(h, m, jitterMin)
-            LocalConfig.save(ctx, c.copy(nextPick = at))
+            // 续排（allowToday=false）：一律重抽到严格未来；或已排时刻已过期 → 也重抽。
+            // retryAt 一并清掉：补签已经跑完（或本来就没有），不清会让下一次续排
+            // 又被上面那条 if 拦回去。
+            pickAt(h, m, jitterMin).also { LocalConfig.save(ctx, c.copy(nextPick = it, retryAt = 0L)) }
         }
         arm(ctx, at)
     }

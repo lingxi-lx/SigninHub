@@ -26,8 +26,8 @@ android {
         applicationId = "com.signhub.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 262
-        versionName = "2.62"
+    versionCode = 291
+        versionName = "2.63"
 
         // L12（BUGS-v2.61）：只保留真机 ABI。原来打出来的 APK 带 arm64-v8a /
         // armeabi-v7a / x86 / x86_64 四份 native 库（libdatastore_shared_counter.so），
@@ -38,13 +38,13 @@ android {
     }
 
     buildFeatures {
-        compose = true
+        // V2.63：关掉 compose。旧的「原生 Compose 界面」MainActivity 已整个删除
+        // （零 Intent 入口的死代码），全仓再无 @Composable，留着只会让 APK 多背
+        // compose-runtime / material3 / icons-extended 三套库。
+        compose = false
         // AGP 8 默认关掉 BuildConfig 生成；设置页要读 BuildConfig.VERSION_NAME 显示版本号，
         // 必须显式打开，否则 LocalApi 里会报 Unresolved reference: BuildConfig。
         buildConfig = true
-    }
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.14"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -111,20 +111,16 @@ android {
 }
 
 dependencies {
-    implementation(platform("androidx.compose:compose-bom:2024.06.00"))
-    implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.ui:ui-tooling-preview")
-    implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
-    implementation("androidx.activity:activity-compose:1.9.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.2")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.2")
+    // V2.63：删掉整套 Compose 依赖（compose-bom / ui / ui-tooling-preview / material3 /
+    // material-icons-extended / activity-compose / lifecycle-*-compose）。原生的
+    // MainActivity 是零入口死代码，已整个删除，全仓再无 @Composable。
+    // 注意 WebUiActivity 仍然继承 androidx.activity.ComponentActivity，
+    // 所以 activity 依赖不能整个拿掉 —— 换成不带 Compose 的 activity-ktx。
+    implementation("androidx.activity:activity-ktx:1.9.0")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.webkit:webkit:1.11.0")
     implementation("androidx.work:work-runtime-ktx:2.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    debugImplementation("androidx.compose.ui:ui-tooling")
 }

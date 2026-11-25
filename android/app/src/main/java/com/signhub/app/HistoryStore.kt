@@ -142,7 +142,7 @@ class HistoryStore(ctx: Context) {
     fun upsert(day: String, r: CheckinResult, accountKey: String = DEFAULT_ACCOUNT) {
         val db = helper.writableDatabase
         val prev = existingStatus(db, day, r.provider, accountKey)
-        val keepPrev = isOk(prev) && !isOk(r.status)
+        val keepPrev = RecordMerge.keepPrev(prev, r.status)
         val cv = ContentValues().apply {
             put("provider", r.provider)
             put("day", day)
@@ -157,15 +157,23 @@ class HistoryStore(ctx: Context) {
                 put("points", r.points)
             }
             put("created_at", now())
-            put("total_points", r.totalPoints)
-            put("streak_days", r.streakDays)
-            put("used_points", r.usedPoints)
+            // BUGS-v2.63-290 P2-1：失败分支只带 status/message，三个数字字段是默认的 -1。
+            // 以前无条件写，于是「签到成功读到 773 → 再失败一次 → 首页变 —」。
+            // -1 是「这次没读到」，必须保留库里已有的值（与后端 db.add_sign_log 同口径）。
+            put("total_points", totalOf(db, "total_points", day, r.provider, accountKey, r.totalPoints))
+            put("streak_days", totalOf(db, "streak_days", day, r.provider, accountKey, r.streakDays))
+            put("used_points", totalOf(db, "used_points", day, r.provider, accountKey, r.usedPoints))
             put("account_key", accountKey)
         }
         db.insertWithOnConflict("records", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
-    private fun isOk(status: String?): Boolean = status == "success" || status == "already"
+    private fun isOk(status: String?): Boolean = RecordMerge.isOk(status)
+
+    /** 这次读到的数字（next）≥ 0 就用它，否则保留库里旧值。 */
+    private fun totalOf(
+        db: SQLiteDatabase, col: String, day: String, provider: String, accountKey: String, next: Int
+    ): Int = RecordMerge.total(oneColumn(db, col, day, provider, accountKey)?.toIntOrNull() ?: -1, next)
 
     private fun existingStatus(db: SQLiteDatabase, day: String, provider: String, accountKey: String): String? =
         oneColumn(db, "status", day, provider, accountKey)
@@ -296,6 +304,92 @@ class HistoryStore(ctx: Context) {
         }
         return out
     }
+
+    /**
+     * 当天该账号是否已经签过 —— 签过就把那条记录原样包成 [CheckinResult] 返回，否则 null。
+     *
+     * 为什么要这个（用户 m06895）：6 点手动签过、8 点定时任务又跑一遍，会把所有账号
+     * 再打一次上游。本地原本只有两处「跳过」机制，都盖不住这个场景：
+     *   - `CheckinGate` 的复用表只活 8 秒（`RECENT_TTL_MS`），跨 2 小时早过期；
+     *   - `HwTodayMark` 只覆盖华为一家。
+     * 于是 WorkBuddy / Trae / Qoder / MiniMax / 智谱 / 千帆 每家都真发一次请求。
+     *
+     * **返回的是原记录本身**（status/message/points/total/streak/used 全部照抄），
+     * 不是伪造一条「已签到」—— 调用方拿到后照常 `upsert`，写回去的值与库里一致，
+     * 不会把已有积分/文案冲掉，也不会让首页从「已签到 773」跳成「已签到」。
+     *
+     * 只认 success / already 两种状态；fail 不算签过（用户点重试必须能重打）。
+     */
+    fun doneResult(
+        day: String,
+        provider: String,
+        accountKey: String = DEFAULT_ACCOUNT,
+    ): CheckinResult? {
+        val rec = recordsOfProvider(day, provider).firstOrNull { it.accountKey == accountKey }
+            ?: return null
+        if (rec.status != "success" && rec.status != "already") return null
+        return CheckinResult(
+            provider = rec.provider,
+            status = rec.status,
+            message = rec.message,
+            points = rec.points,
+            totalPoints = rec.totalPoints,
+            streakDays = rec.streakDays,
+            usedPoints = rec.usedPoints,
+        )
+    }
+
+    /**
+     * 当天**已签完**的账号，一次查完，键是 `provider + "|" + accountKey`。
+     *
+     * 给 `LocalApi.checkinAll()` 用：那边的每账号网络请求都在线程池里跑，
+     * 而本项目硬规则是「线程池里绝不碰 SQLite」，所以必须**在派 job 之前**
+     * 在调用线程上把这张表查好，job 里只做 `map[key]` 查表。
+     *
+     * 只收 success / already —— fail 不算签过，用户点重试必须能重打。
+     */
+    fun doneMap(day: String): Map<String, CheckinResult> {
+        val out = mutableMapOf<String, CheckinResult>()
+        helper.readableDatabase.rawQuery(
+            "SELECT id,provider,day,status,message,points,created_at,total_points,streak_days,account_key," +
+                "used_points FROM records WHERE day=? AND (status='success' OR status='already')",
+            arrayOf(day)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val r = readRec(c)
+                out[r.provider + "|" + r.accountKey] = CheckinResult(
+                    provider = r.provider,
+                    status = r.status,
+                    message = r.message,
+                    points = r.points,
+                    totalPoints = r.totalPoints,
+                    streakDays = r.streakDays,
+                    usedPoints = r.usedPoints,
+                )
+            }
+        }
+        return out
+    }
+
+    /**
+     * 删掉某天某 provider 某一个账号的记录（用户 m06802）。
+     *
+     * 为什么必须有这个：`LocalApi.providerRow` 在没有账号列表时会**拿当天历史记录反推卡片**，
+     * 于是「重置凭据」清掉了主账号凭据，那张卡却仍然画在首页 —— 状态还是重置前的
+     * 「已签到 773」。用户点完重置看到卡片没消失，只能以为没生效。
+     *
+     * 只删指定的 account_key，不动同 provider 的其他账号（多账号不受重置影响）。
+     */
+    fun deleteAccount(day: String, provider: String, accountKey: String = DEFAULT_ACCOUNT): Int =
+        try {
+            helper.writableDatabase.delete(
+                "records", "day=? AND provider=? AND account_key=?",
+                arrayOf(day, provider, accountKey)
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "删除记录失败 provider=$provider day=$day key=$accountKey", e)
+            0
+        }
 
     private fun readRec(c: android.database.Cursor): Rec = Rec(
         c.getLong(0), c.getString(1), c.getString(2), c.getString(3),
@@ -429,4 +523,27 @@ class HistoryStore(ctx: Context) {
                     UNIQUE(provider, day, account_key) ON CONFLICT REPLACE
                 )"""
     }
+}
+
+/**
+ * 记录合并规则（BUGS-v2.63-290 P2-1）。
+ *
+ * 抽成纯函数是为了能在 JVM 单测里锁住语义（见 docs/TEST-COVERAGE-PLAN.html 的 L1-1）：
+ * 这段判定原先直接写在 upsert 里，只有「状态 / 文案 / 增量」被保护，
+ * 「总积分」这一路从来没有被断言过，于是漏了整整一版。
+ */
+internal object RecordMerge {
+    fun isOk(s: String?): Boolean = s == "success" || s == "already"
+
+    /** 已有 success/already、这次不是 → 保留旧状态与旧文案 */
+    fun keepPrev(prev: String?, next: String?): Boolean = isOk(prev) && !isOk(next)
+
+    /**
+     * total_points / streak_days / used_points 的合并。
+     *
+     * -1 的语义是「这次没读到」（读数读不到一律返 -1，绝不返 0），
+     * 此时必须保留旧值，否则首页「当前可用」会从 773 变成「—」。
+     * 注意 -2 是**后端**的「该服务没有积分概念」哨兵，安卓侧不用，别顺手搬过来。
+     */
+    fun total(prev: Int, next: Int): Int = if (next >= 0) next else prev
 }

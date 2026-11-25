@@ -38,13 +38,17 @@ class AutoCheckinWorker(
             return Result.success()
         }
 
-        if (needRetry) return Result.retry()
-
-        // 排下一次（单次任务模式的必要一步，否则明天不会跑）
+        // BUGS-v2.63-290 P3-5：retry 分支以前直接 return，不排下一次。
+        // WorkManager 默认重试 10 次、指数退避约 8~9 小时，重试耗尽后任务终止，
+        // 而这条降级链路上没有别的闹钟 —— 自动签到会永久停摆，
+        // 用户只会看到「某天起不再自动签」。所以先续排，再决定要不要 retry。
         try {
             AutoCheckinScheduler.scheduleNext(applicationContext)
         } catch (_: Exception) {
         }
+        // 与 CheckinRunner 的 attempt < 2 判据对齐：给网络抖动一次机会，之后不再 retry，
+        // 免得同一轮被 WorkManager 反复拉起又反复失败（每次都会往通知栏写一条）。
+        if (needRetry && runAttemptCount < 2) return Result.retry()
         return Result.success()
     }
 }

@@ -401,7 +401,7 @@ object LocalCheckin {
      * MiniMax 设备指纹。
      *
      * 以前 uuid / device_id 的兜底值写死在两处（签到 + 查余额），全局同一个
-     * "<已移除的写死 uuid>" / "<已移除的写死 deviceId>"。所有用户共用一套指纹，
+     * "<旧版本写死的 uuid>" / "<旧版本写死的 deviceId>"。所有用户共用一套指纹，
      * 上游按 uuid 聚合就把所有人看成一家，风控一打死就是整批。
      * 这里改成按账号稳定派生：同一账号每次同一个值（保住「设备不变」的语义），
      * 不同账号不会撞。用户显式填了 uuid / deviceId 时仍然优先用填的。
@@ -1034,6 +1034,7 @@ object LocalCheckin {
     suspend fun qoder(
         region: String, token: String, uid: String, machineId: String, proxy: String,
         refreshToken: String = "",
+        onRenewed: ((token: String, refresh: String) -> Unit)? = null,
     ): CheckinResult = withContext(Dispatchers.IO) {
         if (token.isBlank() && refreshToken.isBlank()) return@withContext CheckinResult(
             "qoder", "fail", "缺少凭据：填 dt- 的 accessToken，或 drt- 的 refreshToken（推荐，有效期一年）")
@@ -1067,6 +1068,13 @@ object LocalCheckin {
                 ?: return@withContext CheckinResult(
                     "qoder", "fail", "refreshToken 续期失败：drt- 可能已失效，请重新登录 Qoder CN 客户端")
             tok = r.first
+            // BUGS-v2.63-287 P3-1：新 refresh_token 一旦变了就必须回写，否则下一次
+            // 还在用旧的换 access。上游当前不轮换（AGENTS.md §6），所以这里平时不触发；
+            // 一旦上游改成轮换，不回写就表现为「某天起天天提示 refreshToken 续期失败」——
+            // 静默退化，没有日志线索。用回调而不是改返回值，是为了不动另外几处解构形状。
+            if (r.second.isNotBlank() && r.second != refreshToken) {
+                runCatching { onRenewed?.invoke(r.first, r.second) }
+            }
         }
 
         fun headers(t: String): MutableMap<String, String> {
@@ -1102,6 +1110,10 @@ object LocalCheckin {
                 val r = renew(refreshToken)
                 if (r != null) {
                     tok = r.first
+                    // BUGS-v2.63-287 P3-1：第二处续期同样要回写新 refresh_token
+                    if (r.second.isNotBlank() && r.second != refreshToken) {
+                        runCatching { onRenewed?.invoke(r.first, r.second) }
+                    }
                     val again = get("$base/sash/api/v1/me/campaigns?clientType=10", headers(tok), c)
                     code = again.first
                     text = again.second
@@ -1120,7 +1132,7 @@ object LocalCheckin {
                     "qoder", "already", "当前没有可领取的积分活动（活动未开窗或已结束）")
                 val total = list.sumOf { amountOf(it) }
                 // 持有额度走 /api/v1/me/usage（与卡片口径一致），活动面额只写进 message
-                val sums = qoderHeldAndUsed(region, tok, uid, machineId, proxy, refreshToken)
+                val sums = qoderHeldAndUsed(region, tok, uid, machineId, proxy, refreshToken, onRenewed)
                 return@withContext CheckinResult(
                     // Qoder 不是「签到」：每日 10:00（UTC+8）刷新一次积分活动（用户 m08264 第 ② 条）
                     "qoder", "already", "今日已领取（本期 $total Credits）· 每日 10:00（UTC+8）刷新", "",
@@ -1149,7 +1161,7 @@ object LocalCheckin {
                 }
             }
             if (gained > 0) {
-                val sums = qoderHeldAndUsed(region, tok, uid, machineId, proxy, refreshToken)
+                val sums = qoderHeldAndUsed(region, tok, uid, machineId, proxy, refreshToken, onRenewed)
                 CheckinResult(
                     "qoder", "success", "已领取 +$gained Credits · 每日 10:00（UTC+8）刷新",
                     "+$gained", sums.first, usedPoints = sums.second)
@@ -1313,13 +1325,17 @@ object LocalCheckin {
     suspend fun qoderHeldAndUsed(
         region: String, token: String, uid: String, machineId: String, proxy: String,
         refreshToken: String = "",
+        onRenewed: ((token: String, refresh: String) -> Unit)? = null,
     ): Pair<Int, Int> = withContext(Dispatchers.IO) {
         if (token.isBlank() && refreshToken.isBlank()) return@withContext Pair(-1, -1)
         val base = if (region.trim().lowercase() == "intl") "https://openapi.qoder.sh"
         else "https://openapi.qoder.com.cn"
         val c = clientFor(proxy)
 
-        fun renew(rt: String): String? {
+        // BUGS-v2.63-287 P3-2：这份 renew 原来只返回 `String?`，`refresh_token` 连读都没读。
+        // 与 [qoder] 里那份（返回 `Pair<String, String>`）逐字同构，只有返回类型不同 ——
+        // 余额路径也在续期，所以同样会把新 refresh_token 丢掉。改成同样的 Pair。
+        fun renew(rt: String): Pair<String, String>? {
             if (rt.isBlank()) return null
             return try {
                 val (code, text) = post(
@@ -1329,7 +1345,9 @@ object LocalCheckin {
                     JSONObject().put("refresh_token", rt.trim()).toString(), c)
                 if (code !in 200..299) return null
                 val d = parse(text)
-                d.optString("device_token").ifBlank { d.optString("token") }.ifBlank { null }
+                val nt = d.optString("device_token").ifBlank { d.optString("token") }
+                if (nt.isBlank()) null
+                else Pair(nt, d.optString("refresh_token").ifBlank { rt.trim() })
             } catch (e: Exception) {
                 null
             }
@@ -1359,12 +1377,22 @@ object LocalCheckin {
 
         try {
             var tok = token.trim()
-            if (tok.isBlank()) tok = renew(refreshToken) ?: return@withContext Pair(-1, -1)
+            if (tok.isBlank()) {
+                val r = renew(refreshToken) ?: return@withContext Pair(-1, -1)
+                tok = r.first
+                // BUGS-v2.63-287 P3-2：余额路径同样回写新 refresh_token
+                if (r.second.isNotBlank() && r.second != refreshToken) {
+                    runCatching { onRenewed?.invoke(r.first, r.second) }
+                }
+            }
             var (code, text) = get("$base/api/v1/me/usage", headers(tok), c)
             if ((code == 401 || code == 403) && refreshToken.isNotBlank()) {
-                val nt = renew(refreshToken)
-                if (nt != null) {
-                    tok = nt
+                val r = renew(refreshToken)
+                if (r != null) {
+                    tok = r.first
+                    if (r.second.isNotBlank() && r.second != refreshToken) {
+                        runCatching { onRenewed?.invoke(r.first, r.second) }
+                    }
                     val again = get("$base/api/v1/me/usage", headers(tok), c)
                     code = again.first
                     text = again.second
@@ -1380,8 +1408,8 @@ object LocalCheckin {
     /**
      * Qoder 账号昵称（用户 m16091）。读不到返回空串。
      *
-     * GET /api/v1/collaboration/users/me → {"success":true,"data":{"nickname":"<昵称>",
-     *   "displayName":"<注册昵称>","id":"<账号ID>","avatarUrl":"..."}}
+     * GET /api/v1/collaboration/users/me → {"success":true,"data":{"nickname":"Dylan",
+     *   "displayName":"AYANG23","id":"01a1f7d2-...","avatarUrl":"..."}}
      *
      * 实测要点：
      * · **只能打 openapi.qoder.com.cn**。换 qoder.cn / qoder.com.cn 都返

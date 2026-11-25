@@ -139,6 +139,9 @@ def run_one(key: str) -> dict:
     providers = build_providers(cfg)
     if key not in providers:
         raise KeyError(f"unknown provider: {key}")
+    # 已下线的服务不该被打（BUGS-v2.63-290 P3-3）；server 侧也会先拦一次并给出明确文案
+    if key not in active_keys(cfg):
+        raise KeyError(f"retired provider: {key}")
     return _run_provider_guarded(key, providers[key], cfg)
 
 
@@ -197,6 +200,22 @@ def _fmt(v):
         return str(v)
 
 
+def active_keys(cfg: dict) -> set:
+    """该不该参与签到：`enabled` 为真 **且** 没标 `retired`。
+
+    BUGS-v2.63-290 P3-3：`retired` 原先只有 /api/status、/api/test、all_done_today
+    三处认，run_all 与 run_one 不认 —— 界面上看不到的服务，照样被「一键全部签到」
+    和定时任务打一遍上游，失败记录进库，污染 /api/stats 的成功率与连续天数判定。
+    现在四个入口统一走这一个函数，避免口径再漂。
+    """
+    out = set()
+    for k, v in (cfg.get("providers") or {}).items():
+        v = v or {}
+        if v.get("enabled", True) and not v.get("retired"):
+            out.add(k)
+    return out
+
+
 def all_done_today() -> dict:
     """今天是不是「所有已就绪的服务都已签完」。
 
@@ -217,12 +236,13 @@ def all_done_today() -> dict:
     off = cfg["scheduler"].get("timezone_offset_hours", 8)
     day = db.today_str(off)
     summary = db.day_summary(day)
+    enabled_keys = active_keys(cfg)
     active = 0
     pending = []
     for key, p in providers.items():
-        pcfg = cfg["providers"].get(key) or {}
-        if pcfg.get("retired") or not pcfg.get("enabled", True):
+        if key not in enabled_keys:
             continue
+        pcfg = cfg["providers"].get(key) or {}
         try:
             # light=True：不为了判「签没签完」去打上游体检（qoder/minimax 各要 250ms）
             rd = readiness(key, pcfg, str(DATA_DIR), light=True)
@@ -254,7 +274,9 @@ def run_all(trigger: str = "manual") -> dict:
                 msg = "你今天已经完成全部签到啦！"
                 return {"trigger": trigger, "skipped": True, "done": True,
                         "message": msg, "results": {}, "summary": msg}
-        keys = [k for k in providers if cfg["providers"][k].get("enabled", True)]
+        # 统一口径（BUGS-v2.63-290 P3-3）：enabled 且没标 retired，见 active_keys
+        ok_keys = active_keys(cfg)
+        keys = [k for k in providers if k in ok_keys]
         results = {}
         if keys:
             # 各家签到互不依赖，并行发出去；总耗时 ≈ 最慢那家而不是各家之和。

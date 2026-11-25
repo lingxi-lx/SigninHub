@@ -42,14 +42,23 @@
     reportErr("rejection", (r && (r.message || r)) + "");
   });
 
-  // 豆包已下线（2026-11-20 服务端 710010702 风控封禁），四家的标签/图标/emoji
-  // 里不再保留它的条目 —— /api/status 只返这四家，留着永远不会被命中。
+  // 豆包于 V2.25 下线（2026-11-20 服务端 710010702 风控封禁），V2.66 重新接入：
+  // 实测签到接口并没有封死（七种调用方式都只回 710012001 登录已过期），
+  // 所以改成「整串 Cookie 直连」——不需要 a_bogus 签名，也不需要 WebView。
+  // V2.68 起补齐 LOGO（官方 lf-flow-web-cdn 的 logo.png 300×300 缩放而来）。
+  // V2.75 起**搁置隐藏**（DoubaoWebCheckin.ENABLED=false）：手机端 LocalApi 不再返回
+  // providers.doubao / status.providers[doubao]，下面的 knownKeys 过滤后自动不画这张卡，
+  // 记录页的筛选 chip 也已从 index.html 删除。这里的 LABELS/LOGOS/EMOJI 条目刻意保留，
+  // 将来改回 true 就能立刻恢复，不用再补一遍。
   const LABELS = {
     workbuddy: "WorkBuddy",
     traesolo: "Trae Solo",
     qoder: "Qoder CN",
     minimax: "MiniMax Code",
     huawei: "华为码道",
+    doubao: "豆包",
+    zhipu: "智谱清言",
+    qianfan: "百度千帆",
   };
   /* 真实 LOGO（从本机 App 资源提取，见 backend/web/static/logos/） */
   const LOGOS = {
@@ -58,6 +67,9 @@
     qoder: "/static/logos/qoder-128.png",
     minimax: "/static/logos/minimax-128.png",
     huawei: "/static/logos/huawei-128.png",
+    doubao: "/static/logos/doubao-128.png",
+    zhipu: "/static/logos/zhipu-128.png",
+    qianfan: "/static/logos/qianfan-128.png",
   };
   const LOGO_2X = {
     workbuddy: "/static/logos/workbuddy-256.png",
@@ -65,8 +77,14 @@
     qoder: "/static/logos/qoder-256.png",
     minimax: "/static/logos/minimax-256.png",
     huawei: "/static/logos/huawei-256.png",
+    doubao: "/static/logos/doubao-256.png",
+    zhipu: "/static/logos/zhipu-256.png",
+    qianfan: "/static/logos/qianfan-256.png",
   };
-  const EMOJI = { workbuddy: "🧩", traesolo: "🚀", qoder: "🅠", minimax: "◈", huawei: "☁" };
+  const EMOJI = {
+    workbuddy: "🧩", traesolo: "🚀", qoder: "🅠", minimax: "◈", huawei: "☁", doubao: "🫘",
+    zhipu: "✦", qianfan: "🅑",
+  };
   function hasLogo(key) { return !!LOGOS[key]; }
   function iconHTML(key) {
     if (LOGOS[key]) {
@@ -132,7 +150,7 @@
     return data;
   }
 
-  const state = { status: null, config: null, stats: null, logFilter: "", wheelHour: null, wheelMin: null, wheelLocked: true, lastTest: {}, growthLoaded: false, heat: null, stackOpen: {}, readySnapshot: null, autoRefreshing: false, wbAccounts: null };
+  const state = { status: null, config: null, stats: null, logFilter: "", wheelHour: null, wheelMin: null, wheelLocked: true, lastTest: {}, growthLoaded: false, heat: null, stackOpen: {}, readySnapshot: null, autoRefreshing: false, wbAccounts: null, wbAccountsErr: "" };
 
   /* 凭据「从无到有」的检测（用户 m13271：登录新 agent 后自动刷新一次余额）。
      用前后快照对比，而不是每次 loadAll 都刷 —— 25 秒轮询每轮打一次上游太重。
@@ -310,9 +328,25 @@
     if (msg.indexOf("没有签到活动") >= 0 || msg.indexOf("没有可领取的签到活动") >= 0) {
       return "无签到活动 · 仅显示余额";
     }
+    // 失败文案统一截到 ~20 字（完整原文仍在 title 上）。抽成函数是为了让
+    // Qoder 分支与通用 fail 分支不会各写一套，改一处漏一处（BUGS-v2.63-290 P2-2）。
+    const shortMsg = (s) => (s.length > 20 ? s.slice(0, 20) + "…" : s);
     // Qoder 不是「签到」而是每日 10:00（UTC+8）刷新的积分活动（用户 m08264 第 ② 条）：
     // 说「签到成功」会让人以为明天 0 点又能领，实际要等到 10:00。
-    if (p.key === "qoder") return done ? "已领取 · 每日 10:00 刷新" : "每日 10:00 后可领";
+    // 但失败必须优先说原因：token 失效 / 9074 风控 / 活动没开 与「还没到 10 点」
+    // 在界面上长得一模一样，用户看不出要重新登录（BUGS-v2.63-290 P2 ②）。
+    if (p.key === "qoder") {
+      if (done) return "已领取 · 每日 10:00 刷新";
+      if (p.status === "fail" && msg) return shortMsg(msg);
+      return "每日 10:00 后可领";
+    }
+    // 失败必须把原因摆出来（用户 m05383）：以前 fail 和 idle 都写「未签到」，失败原因
+    // 只塞在 title 属性里，手机上要长按才看得到 —— 用户只看到「主账号签不上」，
+    // 完全无法自查（是 token 过期、还是 9074 风控、还是活动没开）。这里把 message
+    // 截到 ~20 字直接显示；完整原文仍在 title 里。
+    if (p.status === "fail" && msg) {
+      return shortMsg(msg);
+    }
     // 用户 m14001：状态就用「已签到 / 未签到」两句直说，不要「今日已签到 / 请签到」
     // 这种一边陈述一边祈使的混搭 —— 两句话法不一致，扫一眼分不出这是状态还是按钮。
     return done ? "已签到" : "未签到";
@@ -352,7 +386,8 @@
         const modeText = p.mode === "browser" ? "浏览器"
         : (p.mode === "wb" || p.mode === "trae"
            || p.mode === "qoder" || p.mode === "minimax"
-           || p.mode === "huawei" ? "直连" : "接口");
+           || p.mode === "huawei" || p.mode === "doubao"
+           || p.mode === "zhipu" || p.mode === "qianfan" ? "直连" : "接口");
         const badge = disabled
           ? `<span class="svc-tag">已禁用</span>`
           : (p.ready ? `<span class="svc-tag">${modeText}</span>`
@@ -378,8 +413,8 @@
         html.push(`<div class="svc t-${escapeHtml(st === "already" ? "already" : st)}${multi && ai > 0 && !unfolded ? " piled" : ""}" data-key="${escapeHtml(p.key)}" data-acct="${a ? escapeHtml(a.account_key || "") : ""}" data-pile="${multi ? ai : 0}"${multi ? ` data-multi="1"` : ""}>
         <div class="svc-ico${hasLogo(p.key) ? " has-logo" : ""}">${iconHTML(p.key)}</div>
         <div class="svc-main">
-          <div class="svc-name"><span class="svc-label">${escapeHtml(p.label)}</span>${chip}${badge}</div>
-          <div class="svc-sub"${v.message ? ` title="${escapeHtml(v.message)}"` : ""}>${escapeHtml(svcSubText(v))}</div>
+          <div class="svc-name"><span class="svc-label">${escapeHtml(p.label)}</span>${badge}</div>
+          <div class="svc-sub"${v.message ? ` title="${escapeHtml(v.message)}"` : ""}>${chip}<span class="svc-subtxt">${escapeHtml(svcSubText(v))}</span></div>
         </div>
         <div class="svc-right">
           ${svcPointsHTML(v)}
@@ -395,6 +430,8 @@
     });
     wrap.innerHTML = html.join("");
     $$(".ckbtn", wrap).forEach((btn) => {
+      // 签到进行中被轮询重绘时把 busy 补回去（BUGS-v2.63-290 P3-6）
+      if (busyKeys.has(btn.closest(".svc").dataset.key)) btn.classList.add("busy");
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         doCheckin(btn.closest(".svc"));
@@ -506,6 +543,16 @@
    * CSS 过渡（弧线转圈时把节点换掉，动画会从零开始闪一下）。三个 svg
    * 都绝对定位叠在同一处，靠 opacity / dashoffset 决定谁可见。
    */
+  /**
+   * 正在签到的 provider key 集合（BUGS-v2.63-290 P3-6）。
+   *
+   * 25 秒轮询会调 renderStack()，用 `wrap.innerHTML = html.join("")` 整体重建
+   * #stack —— 挂在按钮上的 `.busy` 随之丢失，用户眼前的转圈变回「签到」，
+   * 而 doCheckin 手上还握着已被替换掉的旧节点，勾/叉动画看不见。
+   * 把「进行中」提升成模块级状态，重绘时按 key 补回 busy 即可。
+   */
+  const busyKeys = new Set();
+
   function checkBtnHTML(done) {
     return `<button class="ckbtn ${done ? "done" : ""}" data-act="sign" aria-label="签到">
       <span class="lbl">${done ? "" : "签到"}</span>
@@ -550,6 +597,8 @@
       return;
     }
     const btn = $(".ckbtn", svcEl);
+    // 这张卡属于哪个账号（多账号堆叠时每张卡都带 data-acct）
+    const acctKey = svcEl.dataset.acct || "";
     // `.done` 挡住重复签到；`.fail` 放行（失败后允许直接重试）；
     // `.busy` 挡住重复点击。
     if (!btn || btn.classList.contains("busy") || btn.classList.contains("done")) return;
@@ -557,6 +606,7 @@
     // 先把上一次的 fail 清掉，否则红圈会在转圈时透出来。
     btn.classList.remove("fail", "done");
     btn.classList.add("busy");
+    busyKeys.add(key);
     // 兜底看门狗（用户 m24705）：`.busy` 只有在拿到响应后才会被摘掉，
     // 一旦桥/网络层异常导致 await 永远不 settle（历史上 CheckinGate 锁泄漏就是这样），
     // 卡片会永久转圈，只能清后台重开。这里到点强制落成「失败」，让用户能重试。
@@ -566,6 +616,7 @@
     const armWatchdog = () => {
       watchdog = setTimeout(() => {
         if (!btn.classList.contains("busy")) return;
+        busyKeys.delete(key);
         btn.classList.remove("busy");
         btn.classList.add("fail");
         toast(`${LABELS[key] || key} 无响应：等了 95 秒仍未拿到结果，可再点一次重试`, 4000);
@@ -576,19 +627,39 @@
     try {
       const res = await api("/api/checkin/" + key, { method: "POST" });
       clearWatchdog();
-      if (p) { p.status = res.status; p.points = res.points || p.points; p.message = res.message; }
-      markSvcResult(svcEl, res);
+      if (p) {
+        p.status = res.status;
+        p.points = res.points || p.points;
+        p.message = res.message;
+        p.total_points = res.total_points;
+      }
+      // 多账号（BUGS-v2.63-290 P3-2）：进度环按 accounts 逐条统计，
+      // 只改 provider 级等于没改 —— 头卡已经 ✓、环上分子仍是旧值，要等下一轮轮询。
+      const acctRow = ((p && p.accounts) || []).find((x) => (x.account_key || "") === acctKey);
+      if (acctRow) {
+        acctRow.status = res.status;
+        acctRow.points = res.points || acctRow.points;
+        acctRow.message = res.message;
+        acctRow.total_points = res.total_points;
+      }
+      // 签到期间轮询可能已整体重建过 #stack（P3-6）：终态要落在屏幕上当前那张卡，
+      // 而不是被替换掉的旧节点 —— 否则勾/叉动画和文案都看不见。
+      const liveCard = $$(`#stack .svc[data-key="${key}"]`).find(
+        (el) => (el.dataset.acct || "") === acctKey) || svcEl;
+      const liveBtn = $(".ckbtn", liveCard) || btn;
+      busyKeys.delete(key);
+      markSvcResult(liveCard, res);
       // 签完立刻按新状态重排：成功的收进牌堆，失败的留在展开区
       stackLayout();
       // 终态：成功/已签 → 勾；失败 → 叉。两者都先摘 busy 再上终态，
       // 这样弧线动画是「接着转完再变」，不是被硬切。
-      btn.classList.remove("busy");
+      liveBtn.classList.remove("busy");
       if (res.status === "fail") {
-        btn.classList.add("fail");
+        liveBtn.classList.add("fail");
         toast(`${LABELS[key] || key} 失败：${res.message || ""}`, 3600);
       } else {
-        btn.classList.add("done");
-        setTimeout(() => burst(btn), 120);
+        liveBtn.classList.add("done");
+        setTimeout(() => burst(liveBtn), 120);
         if (key === "qoder") {
           // Qoder 是每日 10:00 刷新的积分活动，不是「签到」：直接把后端那句
           // 「已领取 +100 Credits · 每日 10:00（UTC+8）刷新」透出来（用户 m08264 第 ② 条）。
@@ -602,8 +673,12 @@
       refreshProgress();
     } catch (err) {
       clearWatchdog();
-      btn.classList.remove("busy");
-      btn.classList.add("fail");
+      busyKeys.delete(key);
+      const liveCard = $$(`#stack .svc[data-key="${key}"]`).find(
+        (el) => (el.dataset.acct || "") === acctKey) || svcEl;
+      const liveBtn = $(".ckbtn", liveCard) || btn;
+      liveBtn.classList.remove("busy");
+      liveBtn.classList.add("fail");
       toast("签到失败：" + err.message, 3200);
     }
     clearWatchdog();
@@ -639,7 +714,13 @@
       // 其余服务统一「今日已签到 / 请签到」。
       // 原始 message 挂到 title 上，桌面端悬停仍能看到具体原因，不占卡片空间。
       const key = svcEl.dataset.key || "";
-      sub.textContent = svcSubText({ key: key, status: res.status, message: res.message });
+      // 只改内层文本节点：sub 里还有 <span class="svc-acct">账号 N</span>
+      // （多账号徽章）与 <span class="svc-subtxt">，整体赋值 textContent 会把徽章一起抹掉，
+      // 表现为「同一组卡里只有被点的那张没有编号」，直到 25 秒轮询重绘才恢复
+      // （BUGS-v2.63-290 P3-1）。没有内层节点时再退回整体赋值，兼容旧骨架。
+      const txt = $(".svc-subtxt", sub);
+      const text = svcSubText({ key: key, status: res.status, message: res.message });
+      if (txt) txt.textContent = text; else sub.textContent = text;
       if (res.message) sub.title = res.message; else sub.removeAttribute("title");
     }
   }
@@ -720,11 +801,19 @@
     track.style.transition = tr ? "transform .5s cubic-bezier(.22,1.1,.32,1)" : "none";
     track.style.transform = `translateX(${p}px)`;
   }
+  /* 位移要「整格对齐」：让 rail 左边缘永远落在两格之间的间隙上，而不是按格子中心算。
+     按中心算的话（旧写法 weekPos = weekFirstCenter() - weekCenterOf(i)），19 格里今天
+     在第 6 格，位移 -334px 会让第 0..5 格整体跑到 rail 左侧外面，左边缘留下半个圆角
+     卡片边缘（用户截图里那个空框就是这么来的）。改成取 DAY_STEP 的整数倍后，左边缘
+     对齐到间隙，第一个可见格子必然是完整的。今天会偏离正中最多半格（≈39px），肉眼
+     几乎看不出，但不再出现半格。 */
   function snapWeek(i, draw) {
     weekSelected = i;
-    weekPos = weekFirstCenter() - weekCenterOf(i);
+    const ideal = weekFirstCenter() - weekCenterOf(i);
+    const k = clamp(Math.round(-ideal / DAY_STEP), 0, Math.max(0, weekEls.length - 1));
+    weekPos = -k * DAY_STEP;
     weekApply(weekPos, true);
-    weekEls.forEach((el, k) => el.classList.toggle("active", k === i));
+    weekEls.forEach((el, idx) => el.classList.toggle("active", idx === i));
     if (draw) drawWeekLine(i);
   }
   function drawWeekLine(i) {
@@ -752,8 +841,8 @@
     }
     function rubber(p) {
       const n = weekEls.length;
-      const maxP = weekFirstCenter() - weekCenterOf(0);
-      const minP = weekFirstCenter() - weekCenterOf(n - 1);
+      const maxP = 0;                       // k=0：第 0 格贴左（左边缘落在它前面的间隙里）
+      const minP = -(n - 1) * DAY_STEP;      // k=n-1：最后一格贴左
       if (p > maxP) return maxP + (p - maxP) * 0.3;
       if (p < minP) return minP + (p - minP) * 0.3;
       return p;
@@ -1546,7 +1635,10 @@
     if (!state.stats) { rows.innerHTML = `<div class="empty">暂无统计</div>`; return; }
     const days = state.stats.month_done_days || {};
     $("#statMonth").textContent = state.stats.month || "";
-    const keys = Object.keys(LABELS);
+    // 只画后端真正认得的那几家（电脑端 Python 后端还没有豆包），
+    // 否则会多出一行永远 0 天的空统计。
+    const alive = (state.status && state.status.providers) || [];
+    const keys = Object.keys(LABELS).filter((k) => !alive.length || alive.some((x) => x.key === k));
     const max = Math.max(1, ...keys.map((k) => days[k] || 0));
     rows.innerHTML = keys.map((k) => {
       const n = days[k] || 0;
@@ -1754,7 +1846,7 @@
      Trae/Qoder/MiniMax 只有网页端零散的 ghost-btn，四张卡长得都不一样。
      现在统一由这里渲染，样式走 app.css 的 .lg-row / .lg-main / .lg-multi，
      Android 侧那两个注入函数不再创建按钮（只保留给旧缓存页面兜底）。 */
-  const LOGIN_PROVIDERS = ["workbuddy", "traesolo", "qoder", "minimax", "huawei"];
+  const LOGIN_PROVIDERS = ["workbuddy", "traesolo", "qoder", "minimax", "huawei", "doubao", "zhipu", "qianfan"];
 
   function loginBlockHTML(key) {
     if (LOGIN_PROVIDERS.indexOf(key) < 0) return "";
@@ -1771,7 +1863,12 @@
     // 以前这里特意不渲染，理由写的是「一份 Cookie = 一个会话，换号就是覆盖」——
     // 那个理由只在「凭据是单字段」时成立；现在多账号列表按整条 Cookie 判重，
     // 换号就是新增一条，不再是覆盖。
-    const multiBtn = `<button class="lg-multi" type="button" data-lg-act="multi">
+    //
+    // 智谱清言 / 百度千帆是单账号 provider（多账号列表 MultiAccountsActivity 只认
+    // traesolo / qoder / minimax，其余一律落 else 分支当 MiniMax 处理 —— 那正是
+    // workbuddy 曾经踩过的 bug），所以这里**不给**它们渲染「多账号管理」按钮。
+    const singleOnly = key === "zhipu" || key === "qianfan";
+    const multiBtn = singleOnly ? "" : `<button class="lg-multi" type="button" data-lg-act="multi">
         <span class="lg-ico">${iconHTML(key)}</span>
         <span class="lg-txt">多账号管理</span>
       </button>`;
@@ -1846,6 +1943,9 @@
     qoder: "电脑端请点「读取本机凭据」直接读 Qoder CN 客户端登录态，或把 dt- token 粘到下面",
     minimax: "电脑端请浏览器登录 agent.minimax.cn，F12 → Application → Local Storage → 复制 _token 粘到下面",
     huawei: "电脑端请浏览器登录 devcloud.cn-north-4.huaweicloud.com/chat/home，F12 → Network → 任一带 PromptCenterService 的请求 → 复制整条 Cookie 粘到下面",
+    doubao: "电脑端请浏览器登录 www.doubao.com，F12 → Network → 任一带 sessionid 的请求 → 复制整条 Cookie 粘到下面（手机端点「登录豆包」自动采集更省事）",
+    zhipu: "电脑端请浏览器登录 chatglm.cn，F12 → Application → Cookies → 复制整串 Cookie 粘到下面（手机端点「登录主账号」自动采集更省事）",
+    qianfan: "电脑端请浏览器登录 console.bce.baidu.com，F12 → Application → Cookies → 复制整串 Cookie 粘到下面（手机端点「登录主账号」自动采集更省事）",
   };
 
   /**
@@ -2007,7 +2107,10 @@
     const st = (state.status && state.status.providers) || [];
     $("#readySummary").textContent = `${st.filter((p) => p.ready).length} / ${st.length} 已就绪`;
 
-    box.innerHTML = Object.keys(LABELS).map((key) => {
+    // 只渲染「当前后端认得」的 provider：手机端 LocalApi 有豆包，电脑端 Python 后端还没有，
+    // 直接用 Object.keys(LABELS) 会在电脑端多出一张点了就报错的空卡片。
+    const knownKeys = Object.keys(LABELS).filter((k) => cfg.providers[k] || st.some((x) => x.key === k));
+    box.innerHTML = knownKeys.map((key) => {
       const p = cfg.providers[key] || {};
       const info = st.find((x) => x.key === key) || {};
       const mode = (p.mode || "http").toLowerCase();
@@ -2018,6 +2121,9 @@
       const qdc = p.qoder || {};
       const mmc = p.minimax || {};
       const hwc = p.huawei || {};
+      const dbc = p.doubao || {};
+      const zpc = p.zhipu || {};
+      const qfc = p.qianfan || {};
       const ready = !!info.ready;
       const enabled = p.enabled !== false;
       const badge = !enabled ? `<span class="pv-badge off">已禁用</span>`
@@ -2045,6 +2151,9 @@
             ${key === "qoder" ? `<button data-mode="qoder" class="${mode === "qoder" ? "on" : ""}">Qoder 直连</button>`
               : key === "minimax" ? `<button data-mode="minimax" class="${mode === "minimax" ? "on" : ""}">MiniMax 直连</button>`
               : key === "huawei" ? `<button data-mode="huawei" class="${mode === "huawei" ? "on" : ""}">码道直连</button>`
+              : key === "doubao" ? `<button data-mode="doubao" class="${mode === "doubao" ? "on" : ""}">豆包直连</button>`
+              : key === "zhipu" ? `<button data-mode="zhipu" class="${mode === "zhipu" ? "on" : ""}">智谱直连</button>`
+              : key === "qianfan" ? `<button data-mode="qianfan" class="${mode === "qianfan" ? "on" : ""}">千帆直连</button>`
               : `<button data-mode="http" class="${mode === "http" ? "on" : ""}">接口模式</button>
             <button data-mode="browser" class="${mode === "browser" ? "on" : ""}">浏览器模式</button>
             ${key === "workbuddy" ? `<button data-mode="wb" class="${mode === "wb" ? "on" : ""}">WB 直连</button>` : ""}
@@ -2129,6 +2238,22 @@
           ${key === "huawei" ? `<div class="pv-hw" ${mode === "huawei" ? "" : "hidden"}>
             <label class="field">会话 Cookie（必填）<textarea class="f-hw-cookie" rows="4" placeholder="登录 devcloud.cn-north-4.huaweicloud.com/chat/home 后，F12 → Network → 任一 PromptCenterService 请求 → 复制整条 Cookie">${escapeHtml(hwc.cookie || "")}</textarea></label>
             <label class="field">代理（可选）<input class="f-hw-proxy" value="${escapeHtml(hwc.proxy || "")}" placeholder="http://127.0.0.1:7890" /></label>
+            <p class="muted small" style="margin:0 0 4px">${hwc.authCookieReady
+              ? "✓ 到期自动续期已就绪：会话失效时会自动静默重登一次，不用重输手机号。"
+              : "⚠ 缺 auth.huaweicloud.com 的 Cookie：会话失效后无法自动续期。手机上点「登录华为码道」会自动一起采集。"}</p>
+          </div>` : ""}
+          ${key === "doubao" ? `<div class="pv-db" ${mode === "doubao" ? "" : "hidden"}>
+            <label class="field">网页版 Cookie（必填，含 sessionid）<textarea class="f-db-cookie" rows="4" placeholder="登录 www.doubao.com 后，F12 → Network → 任一带 sessionid 的请求 → 复制整条 Cookie；手机端点上面的「登录主账号」会自动采集">${escapeHtml(dbc.cookie || "")}</textarea></label>
+            <label class="field">活动 scene（一般留空）<input class="f-db-scene" value="${escapeHtml(dbc.scene || "")}" placeholder="留空 = 自动从活动页响应里取 campaign_group_code" /></label>
+            <label class="field">代理（可选）<input class="f-db-proxy" value="${escapeHtml(dbc.proxy || "")}" placeholder="http://127.0.0.1:7890" /></label>
+            <p class="muted small" style="margin:0 0 4px">豆包不需要 a_bogus 签名，也不校验 User-Agent，纯 Cookie 直调即可。Cookie 里必须有 sessionid / sid_tt / uid_tt / sid_guard。签到用的 scene 会自动从活动页响应里取（等于 campaign_group_code），不用手填。</p>
+          </div>` : ""}
+          ${key === "zhipu" ? `<div class="pv-zp" ${mode === "zhipu" ? "" : "hidden"}>
+            <label class="field">整串 Cookie<textarea class="f-zp-cookie" rows="4" placeholder="登录 chatglm.cn 后，F12 → Application → Cookies → https://chatglm.cn → 全选复制成 name=value; name=value；手机端点上面的「登录主账号」会自动采集">${escapeHtml(zpc.cookie || "")}</textarea></label>
+            <label class="field">X-Device-Id（可留空）<input class="f-zp-device" value="${escapeHtml(zpc.deviceId || "")}" placeholder="留空 = 自动从 chatglm_token 的 JWT 里解 device_id" /></label>
+          </div>` : ""}
+          ${key === "qianfan" ? `<div class="pv-qf" ${mode === "qianfan" ? "" : "hidden"}>
+            <label class="field">整串 Cookie<textarea class="f-qf-cookie" rows="4" placeholder="登录 console.bce.baidu.com 后，F12 → Application → Cookies → https://console.bce.baidu.com → 全选复制成 name=value; name=value；手机端点上面的「登录主账号」会自动采集">${escapeHtml(qfc.cookie || "")}</textarea></label>
           </div>` : ""}
           <div class="pv-result ${(state.lastTest[key] || {}).cls || ""}" ${state.lastTest[key] ? "" : "hidden"}>${(state.lastTest[key] || {}).html || ""}</div>
           <div class="pv-actions">
@@ -2181,6 +2306,12 @@
         if (mmBox) mmBox.hidden = mode !== "minimax";
         const hwBox = $(".pv-hw", card);
         if (hwBox) hwBox.hidden = mode !== "huawei";
+        const dbBox = $(".pv-db", card);
+        if (dbBox) dbBox.hidden = mode !== "doubao";
+        const zpBox = $(".pv-zp", card);
+        if (zpBox) zpBox.hidden = mode !== "zhipu";
+        const qfBox = $(".pv-qf", card);
+        if (qfBox) qfBox.hidden = mode !== "qianfan";
       });
     });
     const curlBtn = $(".f-curlparse", card);
@@ -2348,6 +2479,23 @@
           deviceId: $(".f-mm-device", card).value.trim(),
           proxy: $(".f-mm-proxy", card).value.trim(),
         };
+      } else if (mode === "doubao") {
+        bodyObj.doubao = {
+          cookie: $(".f-db-cookie", card).value.trim(),
+          scene: $(".f-db-scene", card).value.trim(),
+          proxy: $(".f-db-proxy", card).value.trim(),
+        };
+      } else if (mode === "zhipu") {
+        bodyObj.zhipu = {
+          cookie: $(".f-zp-cookie", card).value.trim(),
+          deviceId: $(".f-zp-device", card).value.trim(),
+          proxy: "",
+        };
+      } else if (mode === "qianfan") {
+        bodyObj.qianfan = {
+          cookie: $(".f-qf-cookie", card).value.trim(),
+          proxy: "",
+        };
       } else if (mode === "huawei") {
         bodyObj.huawei = {
           cookie: $(".f-hw-cookie", card).value.trim(),
@@ -2449,6 +2597,8 @@
           qoder: [".f-qd-token", ".f-qd-refresh", ".f-qd-uid", ".f-qd-machine"],
           minimax: [".f-mm-token", ".f-mm-uid", ".f-mm-device"],
           huawei: [".f-hw-cookie"],
+          zhipu: [".f-zp-cookie", ".f-zp-device"],
+          qianfan: [".f-qf-cookie"],
         };
         const card2 = $(`.prov-card[data-key="${key}"]`);
         (CRED_FIELDS[key] || []).forEach((sel) => {
@@ -2708,6 +2858,21 @@
   }
   on("#refreshAll2", "click", () => loadAll());
 
+  /* Token 健康：默认收起（用户 m06523）。加了智谱/千帆后一共 7 行，
+     全部铺开会把「签到配置」挤到很下面，所以只露标题行，点标题展开。
+     折叠机制与「通知」「自动签到」同一套 .fold + foldToggle()。 */
+  const thToggle = $("#thToggle");
+  if (thToggle) {
+    thToggle.addEventListener("click", () => {
+      const panel = $("#thPanel");
+      const fold = $("#thFold");
+      if (!panel || !fold) return;
+      const willOpen = !panel.classList.contains("open");
+      panel.classList.toggle("open", willOpen);
+      foldToggle(fold, willOpen);
+    });
+  }
+
   /* 积分资产 */
   // 刷新余额的统一实现：拉 WorkBuddy 资产卡 → 让后端重查两家「当前持有积分」并落库 → 整页回读。
   // 顺序有讲究：先 refresh_totals 把新数字写进当天记录，再 loadAll 才能读到新值；
@@ -2790,7 +2955,10 @@
   });
   /* 账号切换（用户 m14411） */
   on("#growthAcctSwitch", "click", async () => {
-    if (!state.wbAccounts) await loadWbAccounts();
+    // 用户 m05253：点之前总是重拉一次。原来只在 state.wbAccounts 为空时才拉，
+    // 而它首次进页面就被填成「1 个账号」的快照，之后登录第二个账号再也不会更新，
+    // 于是永远弹「当前只有 1 个 WorkBuddy 账号」。/api/wb_accounts 是本地毫秒级接口。
+    await loadWbAccounts();
     openWbAcctSheet();
   });
   on("#growthAcctManage", "click", () => {
@@ -3145,8 +3313,11 @@
      双击某张卡 → 只显示「同一 AGENT」的账号卡，一张卡一个账号。
      只有主账号时提示「你当前尚未配置多账号。」并退出宫格。
      ============================================================ */
-  const ASSET_LABEL = { workbuddy: "WorkBuddy", traesolo: "Trae Solo", qoder: "Qoder CN", minimax: "MiniMax Code", huawei: "华为码道" };
-  const ASSET_CLS = { workbuddy: "wb", traesolo: "tr", qoder: "qd", minimax: "mm", huawei: "hw" };
+  const ASSET_LABEL = { workbuddy: "WorkBuddy", traesolo: "Trae Solo", qoder: "Qoder CN", minimax: "MiniMax Code", huawei: "华为码道", zhipu: "智谱清言", qianfan: "百度千帆" };
+  // BUGS-v2.63 P3-5：这里以前只有五家，智谱/千帆落到 `|| "wb"` 兜底 —— 多账号宫格会把
+  // 它们的账号图标画成 WorkBuddy 的绿配色。配色类本身早就在 app.css 里
+  // （`.asset-ico.zp` / `.asset-ico.qf`），只是这张表没登记，所以只需要补两行。
+  const ASSET_CLS = { workbuddy: "wb", traesolo: "tr", qoder: "qd", minimax: "mm", huawei: "hw", zhipu: "zp", qianfan: "qf" };
 
   function openAssetMulti(key) {
     const box = $("#assetMulti");
@@ -3289,6 +3460,16 @@
       const pQoder = placeholder ? null : provOf("qoder");
       const pMm = placeholder ? null : provOf("minimax");
       const pHw = placeholder ? null : provOf("huawei");
+      // 用户 m06523：智谱清言与百度千帆也要有自己的资产卡。
+      const pZp = placeholder ? null : provOf("zhipu");
+      const pQf = placeholder ? null : provOf("qianfan");
+      // BUGS-v2.63-288 P2：智谱 / 千帆只接进了手机端 LocalApi，电脑端 Python 后端
+      // 没有这两家。硬画会多出两张永远「未配置」的假卡，点一下还会被
+      // jumpToProvider 带着去找一张不存在的配置卡（renderProviderEditors 已按
+      // knownKeys 过滤掉了它们）。所以按 /api/status 里有没有这一家决定画不画；
+      // placeholder=true 表示还没拿到 status，此时未知，先画着避免布局跳动。
+      const hasZp = placeholder || !!pZp;
+      const hasQf = placeholder || !!pQf;
       grid.innerHTML = [
         assetCard("wb", "WorkBuddy", wbCur, wbUsed,
           pWb ? pWb.ready : (placeholder ? null : false), capOverride, "workbuddy"),
@@ -3301,7 +3482,15 @@
         assetCard("mm", "MiniMax Code",
           pMm ? pMm.total_points : -1, pMm ? pMm.used_points : -1,
           pMm ? pMm.ready : (placeholder ? null : false), capOverride, "minimax"),
-        // 华为码道是第五家：2 列网格里它会独占最后一行的左半格，
+        // 智谱 / 千帆都没有「累计已用」口径（member_info 只给 left_score，DuMate 只给
+        // totalPoints），所以背面永远是「—」，不硬编一个 0 冒充。
+        ...(hasZp ? [assetCard("zp", "智谱清言",
+          pZp ? pZp.total_points : -1, -1,
+          pZp ? pZp.ready : (placeholder ? null : false), capOverride, "zhipu")] : []),
+        ...(hasQf ? [assetCard("qf", "百度千帆",
+          pQf ? pQf.total_points : -1, -1,
+          pQf ? pQf.ready : (placeholder ? null : false), capOverride, "qianfan")] : []),
+        // 华为码道放在最后：2 列网格里它会独占最后一行的左半格，
         // 用 .asset-card.wide 让它横跨两列，视觉上收尾（见 app.css）。
         // 积分接口就在签到同域（/chat/snap-manager/v1/statistics/plugin），
         // 用签到那份 cookie 就能读 —— 所以只有「会话失效」这一种读不到的情况。
@@ -3455,10 +3644,15 @@
     try {
       const r = await api("/api/wb_accounts");
       state.wbAccounts = r;
+      state.wbAccountsErr = "";
       paintGrowthAcct(r);
       return r;
     } catch (err) {
-      state.wbAccounts = null;
+      // 用户 m05253：拉失败时不能把 state.wbAccounts 置 null ——
+      // 置 null 之后 paintGrowthAcct 会画成「未登录 WorkBuddy」、
+      // openWbAcctSheet 会弹「还没有登录任何 WorkBuddy 账号」，
+      // 明明本地有账号却谎报没登录。保留上一次成功的结果，只把错误记下来。
+      state.wbAccountsErr = err && err.message ? err.message : "读取账号列表失败";
       return null;
     }
   }
@@ -3480,7 +3674,9 @@
     const r = state.wbAccounts;
     const list = (r && Array.isArray(r.list)) ? r.list : [];
     if (!list.length) {
-      toast("还没有登录任何 WorkBuddy 账号");
+      // 区分「真的没登录」与「接口读失败」：后者不能说成没登录（用户 m05253）
+      if (state.wbAccountsErr) toast("读取账号列表失败：" + state.wbAccountsErr, 3200);
+      else toast("还没有登录任何 WorkBuddy 账号");
       return;
     }
     if (list.length === 1) {
@@ -3642,9 +3838,13 @@
         refreshBalances({ silent: true }).finally(() => { state.autoRefreshing = false; });
       }
       if (!state.growthLoaded) renderGrowth(null);
-      // 成长中心「账号切换」条要显示当前选中的 WorkBuddy 账号；
-      // 不 await —— 它只是给按钮补个名字，失败时保持「当前账号」占位文案即可。
-      if (!state.wbAccounts) loadWbAccounts();
+      // 成长中心「账号切换」条要显示当前选中的 WorkBuddy 账号。
+      // 用户 m05253：必须每次 loadAll 都重拉 —— 原来写成 `if (!state.wbAccounts)`，
+      // 而 state.wbAccounts 首次进页面就被填成当时的快照，之后在多账号页新登录的
+      // 账号永远不会出现在这条栏里（首页卡片会更新，因为它读 /api/status）。
+      // /api/wb_accounts 在 APK 内是纯本地读 SharedPreferences，毫秒级，不必省。
+      // 不 await —— 它只是给按钮补个名字，失败时保持上一次的名字即可。
+      loadWbAccounts();
       // 豆包任务面板已下线（服务端 710010702 封禁），这里不再拉 /api/doubao_tasks。
       return true;
     } catch (err) {
@@ -4092,8 +4292,30 @@
         '点<span class="sh-ok">绿色按钮</span>「登录主账号」。',
         '网页里用华为账号登录，手机号 + 验证码，或者账号密码都行。',
         '登录成功、页面回到码道首页后，软件会自动保存，网页自己关掉，卡片上出现<span class="sh-ok">「就绪」</span>就成了。',
-        '华为的登录状态比较短，<b>半小时到一小时</b>就会过期。过期后卡片会提示「会话已失效」，点「登录主账号」重登一次就行 —— 已经签到的记录不会因此变失败。',
+        '华为的登录状态比较短，<b>半小时到一小时</b>就会过期。软件在签到前会自己静默重登一次（约 2~4 秒，不会弹窗）；重登也续不上时才提示「会话已失效」，点「登录主账号」手动重登一次 —— 已经签到的记录不会因此变失败。',
         '还有第二个号：点<span class="sh-blue">蓝色按钮</span>「多账号管理」→ 再点「＋ 添加账号」→ 重复第 2、3 步。',
+      ],
+    },
+    {
+      key: "zhipu",
+      title: "智谱清言",
+      rows: [
+        '点<span class="sh-ok">绿色按钮</span>「登录主账号」。',
+        '网页里点右上角「登录」，用手机号 + 验证码登录，或者扫码登录都行。',
+        '登录成功后网页自己关掉，凭据自动填好，卡片上出现<span class="sh-ok">「就绪」</span>就成了。',
+        '智谱<b>没登录也有一整套 token</b>，所以只认「真登录」：卡片写「游客态」就说明那次是没登录的状态，回去重登一次。',
+        '登录一次就够，不用反复登 —— 软件每次签到前会用 refresh_token 自动换一个新的 access_token，而这个 refresh_token 本身不会过期轮换。',
+      ],
+    },
+    {
+      key: "qianfan",
+      title: "百度千帆",
+      rows: [
+        '点<span class="sh-ok">绿色按钮</span>「登录主账号」。',
+        '网页里用百度账号登录，手机号 + 验证码，或者账号密码都行。',
+        '登录成功、页面回到百度智能云控制台后，软件会自动保存，网页自己关掉，卡片上出现<span class="sh-ok">「就绪」</span>就成了。',
+        '判据是登录态 Cookie：卡片写「游客态」说明那次没真登录上，回去重登一次。',
+        '这是<b>百度搭子（DuMate）</b>的每日登录奖励，一天一次，领的是搭子积分。',
       ],
     },
     {
@@ -4772,6 +4994,53 @@
       <div class="th-name">华为码道 <span class="th-badge ${hb}">${hl}</span></div>
       ${ptsHTML("huawei")}
       <div class="th-sub">${hs}</div></div></div>`;
+
+    // ---- 智谱清言（V2.76 接入，纯签名）----
+    // 用户 m06523：Token 健康也要有它。判据只看 refresh_token 在不在：
+    // 游客态也有整套 token，所以真正的「已登录」由后端 ready（is_guest 校验）给出。
+    //
+    // BUGS-v2.63-288 P2：智谱 / 千帆只接进了手机端 LocalApi，电脑端 Python 后端
+    // 没有这两家。以前这里无条件追加两行，连电脑端也会显示成「未配置」，
+    // 而那两行带 jumpToProvider 跳转，点进去找的是被 renderProviderEditors
+    // 的 knownKeys 过滤掉、根本不存在的配置卡 → 假入口。
+    // 判据与 renderProviderEditors 保持一致：配置里有，或 status 里有。
+    const hasProv = (k) => !!(s[k]) || provs.some((x) => x && x.key === k);
+    if (hasProv("zhipu")) {
+    const zp = (s.zhipu && s.zhipu.zhipu) || {};
+    const zpReady = provOf("zhipu").ready === true;
+    let zb = "bad", zl = "未配置", zs = "点「登录智谱清言」在站内登录一次即可自动采集 Cookie";
+    if (zpReady) {
+      zb = "ok"; zl = "已配置";
+      zs = "refresh_token 不轮换 · 每次签到前自动换一次 access_token";
+    } else if (zp.cookie) {
+      zb = "warn"; zl = "游客态";
+      zs = "Cookie 是游客态（JWT 里 is_guest=true）· 请重新登录一次";
+    }
+    rows += `<div class="${rowCls(zb === "ok")}" data-key="zhipu"><span class="th-ico has-logo">${iconHTML("zhipu")}</span><div class="th-main">
+      <div class="th-name">智谱清言 <span class="th-badge ${zb}">${zl}</span></div>
+      ${ptsHTML("zhipu")}
+      <div class="th-sub">${zs}</div></div></div>`;
+    }
+
+    // ---- 百度千帆（DuMate）----
+    // 千帆没有 refresh 通道：Cookie 失效就只能重新登录，所以副标题直说这一点。
+    if (hasProv("qianfan")) {
+    const qf = (s.qianfan && s.qianfan.qianfan) || {};
+    const qfReady = provOf("qianfan").ready === true;
+    let fb = "bad", fl = "未配置", fs = "点「登录百度智能云」在站内登录一次即可自动采集 Cookie";
+    if (qfReady) {
+      fb = "ok"; fl = "已配置";
+      fs = "Cookie 直连 · 失效后需重新登录（千帆没有续期接口）";
+    } else if (qf.cookie) {
+      fb = "warn"; fl = "已失效";
+      fs = "Cookie 里没有 BDUSS 或 bce-user-info · 请重新登录一次";
+    }
+    rows += `<div class="${rowCls(fb === "ok")}" data-key="qianfan"><span class="th-ico has-logo">${iconHTML("qianfan")}</span><div class="th-main">
+      <div class="th-name">百度千帆 <span class="th-badge ${fb}">${fl}</span></div>
+      ${ptsHTML("qianfan")}
+      <div class="th-sub">${fs}</div></div></div>`;
+    }
+
     box.innerHTML = rows;
     // 未配置的行可点：跳到对应签到配置卡并展开（用户 m14411）
     if (box.dataset.jumpBound !== "1") {
@@ -4837,12 +5106,15 @@
 
   function initRipple() {
     if (NOANIM) return;                    // #noanim 下整站关动画，波纹也不生成
-    let cur = null, pid = null;
+    let cur = null, clip = null, pid = null;
 
-    function drop(el) {
-      if (!el) return;
-      el.classList.remove("on");
-      el.classList.add("out");
+    function drop() {
+      if (!clip) return;
+      const el = clip, wave = cur;
+      clip = null; cur = null;
+      if (wave) { wave.classList.remove("on"); wave.classList.add("out"); }
+      // 裁切层跟着一起淡出，避免内部圆形先消失、裁切层还挡着一块矩形
+      el.classList.add("gone");
       setTimeout(() => el.remove(), 380);
     }
 
@@ -4852,42 +5124,54 @@
       if (!t) return;
       const host = t.closest(RIPPLE_HOST);
       if (!host || host.disabled) return;
-      if (cur) { cur.remove(); cur = null; }
+      if (clip) { clip.remove(); clip = null; cur = null; }
 
       const r = host.getBoundingClientRect();
       const x = e.clientX, y = e.clientY;
-      // 半径取「触点到控件四角的最远距离」，保证波纹能覆盖整个控件
+      // 用户 m06176：光只填满按键内部，不再外溢。裁切层尺寸/圆角抄控件，
+      // 所以半径取「触点到控件四角的最远距离」就够覆盖整块，不用再乘系数。
       const far = Math.max(
         Math.hypot(x - r.left, y - r.top),
         Math.hypot(x - r.right, y - r.top),
         Math.hypot(x - r.left, y - r.bottom),
         Math.hypot(x - r.right, y - r.bottom),
       );
-      const size = Math.max(72, Math.round(far * 2.1));
+      const size = Math.max(72, Math.round(far * 2));
+      const cs = getComputedStyle(host);
+      const box = document.createElement("div");
+      box.className = "ripple-clip";
+      box.style.left = r.left + "px";
+      box.style.top = r.top + "px";
+      box.style.width = r.width + "px";
+      box.style.height = r.height + "px";
+      box.style.borderRadius = cs.borderRadius;
       const el = document.createElement("div");
       el.className = "ripple";
       el.style.width = size + "px";
       el.style.height = size + "px";
-      el.style.left = (x - size / 2) + "px";
-      el.style.top = (y - size / 2) + "px";
-      document.body.appendChild(el);
+      // 坐标换算成裁切层内部坐标（减去控件左上角）
+      el.style.left = (x - r.left - size / 2) + "px";
+      el.style.top = (y - r.top - size / 2) + "px";
+      box.appendChild(el);
+      document.body.appendChild(box);
       pid = e.pointerId;
+      clip = box;
       cur = el;
       void el.offsetWidth;                 // 强制回流，让 scale(.34)→1 的过渡真正跑起来
       el.classList.add("on");
     }, { passive: true });
 
     document.addEventListener("pointermove", (e) => {
-      if (!cur || e.pointerId !== pid) return;
+      if (!cur || !clip || e.pointerId !== pid) return;
       const size = parseFloat(cur.style.width) || 96;
-      cur.style.left = (e.clientX - size / 2) + "px";
-      cur.style.top = (e.clientY - size / 2) + "px";
+      const r = clip.getBoundingClientRect();
+      cur.style.left = (e.clientX - r.left - size / 2) + "px";
+      cur.style.top = (e.clientY - r.top - size / 2) + "px";
     }, { passive: true });
 
     const up = (e) => {
-      if (!cur || (pid != null && e.pointerId !== pid)) return;
-      drop(cur);
-      cur = null;
+      if (!clip || (pid != null && e.pointerId !== pid)) return;
+      drop();
       pid = null;
     };
     document.addEventListener("pointerup", up, { passive: true });

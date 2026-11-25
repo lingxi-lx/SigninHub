@@ -38,12 +38,25 @@
 html,body{margin:0;height:100%}
 body{
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  color:var(--txt);line-height:1.5;-webkit-font-smoothing:antialiased;
+  overflow-x:hidden;
+}
+/* 页面底色背景层（BUGS-v2.64 P1）。
+   原来三层渐变直接铺在 body 上，而 body 被上面那行 height:100% 钉成恰好一个视口高，
+   background-size:auto + 默认 repeat 就把渐变按「一屏 915px」当平铺单元反复画 ——
+   每滚过一屏都从「左上白」重新开始，交界处一条硬接缝。
+   实测接缝色差 dark 69 / light 64 / mint 73（RGB 三通道差之和），肉眼很明显。
+   改成 position:fixed 伪层：fixed 相对视口而不是文档，天然不参与平铺，
+   滚动时背景也不动（视觉更稳），body 高度怎么变都不影响。
+   z-index:-1 生效的前提是 body 不创建层叠上下文（别在 body 上加 transform/filter/opacity）。 */
+html{background:var(--bg)}
+body{background:none}
+body::before{
+  content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
   background:
     radial-gradient(120% 60% at 85% -8%, rgba(90,70,180,.35) 0%, transparent 55%),
     radial-gradient(120% 55% at 0% 8%, rgba(40,80,200,.22) 0%, transparent 50%),
     var(--bg);
-  color:var(--txt);line-height:1.5;-webkit-font-smoothing:antialiased;
-  overflow-x:hidden;
 }
 /* 桌面端收敛成手机宽度 */
 .app{position:relative;width:100%;max-width:460px;margin:0 auto;min-height:100vh;padding:0 0 calc(var(--tabh) + max(var(--inset-b), env(safe-area-inset-bottom)) + 22px);overflow-x:hidden}
@@ -263,12 +276,12 @@ html[data-theme="light"] .hint.fail .hint-txt,html[data-theme="mint"] .hint.fail
    压过 .tabbar(30) 与 .appbar(25)，卡片滚到底部时就会盖住导航栏、吃掉 tab 的点击。 */
 .stack{position:relative;z-index:0;height:0;margin:0 auto;max-width:420px;
   transition:height .3s cubic-bezier(.16,1,.3,1)}
-.svc{position:absolute;left:0;right:0;top:0;height:78px;border-radius:18px;padding:0 16px;
-  display:flex;align-items:center;gap:13px;cursor:pointer;overflow:hidden;
+.svc{position:absolute;left:0;right:0;top:0;height:78px;border-radius:18px;padding:0 13px;
+  display:flex;align-items:center;gap:10px;cursor:pointer;overflow:hidden;
   background:linear-gradient(150deg,#1b1f2c,#12141d);border:1px solid rgba(255,255,255,.09);
   box-shadow:0 18px 38px -20px rgba(0,0,0,.9);transform-origin:center;
   transition:transform .3s cubic-bezier(.16,1,.3,1),box-shadow .4s,border-color .35s,background .4s}
-.svc-ico{width:44px;height:44px;border-radius:13px;flex:none;display:grid;place-items:center;font-size:22px;
+.svc-ico{width:40px;height:40px;border-radius:12px;flex:none;display:grid;place-items:center;font-size:21px;
   background:rgba(108,140,255,.14);border:1px solid rgba(108,140,255,.25);transition:width .4s,height .4s,font-size .4s}
 /* 真实 LOGO：去掉占位底色，图标完整显示 */
 .svc-ico.has-logo{background:transparent;border-color:transparent;overflow:hidden;padding:0;
@@ -279,9 +292,15 @@ html[data-theme="light"] .hint.fail .hint-txt,html[data-theme="mint"] .hint.fail
    flex-wrap:nowrap + min-width:0 是前提 —— 否则「MiniMax Code」这种长名字
    会把「未配置」徽章压到容器宽度以下，徽章里的字跟着折成「未配/置」两行（用户 m12857）。
    规则：名字可缩（省略号），徽章永不缩、永不折。 */
-.svc-name{font-size:15px;font-weight:700;display:flex;align-items:center;gap:6px;color:var(--txt);
+.svc-name{font-size:15px;font-weight:700;display:flex;align-items:center;gap:5px;color:var(--txt);
   flex-wrap:nowrap;min-width:0}
-/* 名字本体：唯一允许被压缩的元素，缩不下就走省略号，绝不自己折字 */
+/* 名字本体：唯一允许被压缩的元素，缩不下就走省略号，绝不自己折字。
+   V2.68：把「账号 N」徽章从名字行挪到副标题行后，这里可用宽度从 56.6px
+   涨到 124px（360 宽机型），「MiniMax Code」需要 103px，够了，不再截断。
+   仍然保留 ellipsis 作为超长名字（比如用户自定义别名 24 字）的兜底。 */
+/* 用户 m06431：状态徽章（直连 / 接口 / 未配置）要**紧跟名字**，不要被推到积分左侧。
+   原来写 flex:1 1 auto，名字会吃满剩余空间把徽章挤到最右；改成 0 1 auto ——
+   不放大（徽章贴住名字）、可收缩（长名字仍走省略号），两者兼得。 */
 .svc-label{flex:0 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .svc-tag{font-size:9.5px;font-weight:700;color:var(--muted);border:1px solid var(--line);
   border-radius:20px;padding:1px 6px;letter-spacing:0;
@@ -291,13 +310,19 @@ html[data-theme="light"] .hint.fail .hint-txt,html[data-theme="mint"] .hint.fail
      现在压缩只会发生在左边的名字上（省略号），徽章永远完整一行。 */
   flex:none;white-space:nowrap;line-height:1.5}
 /* 多账号徽章：同一服务有多个账号时，名字后面标出这是第几个账号（用户 m08264 第 ① 条 / m08666）。
-   flex:none 必须写 —— .svc-name 是 flex 容器且 .svc-main 有 min-width:0，
+   V2.68：从名字行挪到副标题行 —— 名字行要留够宽度给「MiniMax Code」这种长名，
+   360 宽机型上原本名字只剩 74.6px，截成「MiniMax ...」。挪走后名字行只剩
+   「名字 + 状态徽章」，可用宽度 124px，够放下 103px 的全名。
+   flex:none 必须写 —— 父容器是 flex 且子项有 min-width:0，
    不给 flex:none 会被挤窄、文字被截成「账…」。 */
 .svc-acct{font-size:10px;font-weight:800;color:var(--brand);border:1px solid rgba(108,140,255,.45);
-  background:rgba(108,140,255,.14);border-radius:20px;padding:1px 7px;letter-spacing:.02em;
-  flex:none;white-space:nowrap}
+  background:rgba(108,140,255,.14);border-radius:20px;padding:0 6px;letter-spacing:.02em;
+  flex:none;white-space:nowrap;line-height:1.5;margin-right:5px;vertical-align:middle}
 .svc-sub{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  transition:opacity .3s,max-height .4s;max-height:20px;font-weight:600}
+  transition:opacity .3s,max-height .4s;max-height:20px;font-weight:600;
+  display:flex;align-items:center;min-width:0}
+/* 副标题文字：徽章之后的剩余空间，缩不下才省略 */
+.svc-subtxt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .svc-right{display:flex;align-items:center;gap:10px;transition:opacity .35s}
 .svc-points{font-size:14px;font-weight:800;color:var(--muted);min-width:34px;text-align:right;font-variant-numeric:tabular-nums}
 .svc-points.has{color:var(--ok)}
@@ -417,9 +442,14 @@ html[data-theme="mint"] .creds-alert span{color:#2c4034;opacity:1}
 .muted{color:var(--muted)} .small{font-size:11.5px}
 
 /* ---------- ④ 吸附 + 画线 ---------- */
+/* V2.68：淡出带从 8% 加宽到 14%。原来 8%（≈28px）盖不住边缘那半格里的字 ——
+   用户看到左边缘露出「二 / 4」半截，误以为是排版错位。V2.68 起 snapWeek 改成
+   「整格对齐」（weekPos 取 DAY_STEP 的整数倍），左边缘必然落在两格之间的 7px 间隙上，
+   所以左侧淡出带可以收窄到 4%（≈12px），只吃掉间隙；右侧仍保留较宽的淡出，
+   因为最后一格之后还有 12 个 future 日，右边缘确实会露出半格。 */
 .week-rail{position:relative;overflow:hidden;border-radius:14px;
-  -webkit-mask-image:linear-gradient(90deg,transparent,#000 8%,#000 92%,transparent);
-  mask-image:linear-gradient(90deg,transparent,#000 8%,#000 92%,transparent)}
+  -webkit-mask-image:linear-gradient(90deg,transparent,#000 4%,#000 90%,transparent);
+  mask-image:linear-gradient(90deg,transparent,#000 4%,#000 90%,transparent)}
 .week-track{display:flex;align-items:center;height:84px;cursor:grab;will-change:transform}
 .week-track:active{cursor:grabbing}
 .day{width:64px;flex:none;height:74px;margin:0 7px;border-radius:15px;display:flex;flex-direction:column;
@@ -696,9 +726,20 @@ html[data-theme="mint"]{
   color-scheme: light;
 }
 /* 浅色/清新主题下，逐项翻正深色写死的组件（选择器特异性 ≥ 原规则） */
-html[data-theme="light"] body,html[data-theme="mint"] body{
+/* 背景层同样改到 body::before（见文件开头 P1 说明）。
+   BUGS-v2.64 P2：原来 light 与 mint 共用同一条规则，前两层 radial 写死蓝紫 / 蓝绿，
+   只有末尾 var(--bg) 跟着主题走 —— mint 的底色是绿的却叠一层蓝紫光晕，
+   页面顶部偏蓝、底部偏绿，两个色系在渐变中段打架。
+   现在拆成两条各自同色系：晨雾（light）走蓝，云朵（mint）走绿。
+   实测色相跨度 mint 70° → 6.4°、light 25.5° → 8°。 */
+html[data-theme="light"] body::before{
   background:radial-gradient(120% 60% at 85% -8%, rgba(120,160,255,.20) 0%, transparent 55%),
-             radial-gradient(120% 55% at 0% 8%, rgba(90,200,170,.16) 0%, transparent 50%),
+             radial-gradient(120% 55% at 0% 8%, rgba(70,150,235,.14) 0%, transparent 50%),
+             var(--bg);
+}
+html[data-theme="mint"] body::before{
+  background:radial-gradient(120% 60% at 85% -8%, rgba(80,210,160,.22) 0%, transparent 55%),
+             radial-gradient(120% 55% at 0% 8%, rgba(60,190,150,.16) 0%, transparent 50%),
              var(--bg);
 }
 html[data-theme="light"] .appbar,html[data-theme="mint"] .appbar{background:rgba(255,255,255,0)}
@@ -1099,6 +1140,10 @@ html.noanim .asset-flip.spin{animation:none}
 .asset-ico.mm{background:linear-gradient(135deg,#3f8bff,#7cd0ff)}
 /* 华为码道：CodeArts 品牌紫（#6C5CE7 一带），与 MiniMax 的亮蓝拉开 */
 .asset-ico.hw{background:linear-gradient(135deg,#8a7bff,#5b46d6)}
+/* 智谱清言：chatglm 品牌蓝（深蓝→亮青），与 Trae 的紫蓝、MiniMax 的亮蓝都拉开 */
+.asset-ico.zp{background:linear-gradient(135deg,#2f6bff,#41d3ff)}
+/* 百度千帆：百度蓝→青绿，一眼区分于智谱的单色蓝 */
+.asset-ico.qf{background:linear-gradient(135deg,#2932e1,#00c2b3)}
 /* 第五张卡（华为码道）在 2 列网格里独占最后一行的左半格 →
    让它横跨两列，避免右侧留一块空白。 */
 .asset-grid .asset-card.wide{grid-column:1 / -1}
@@ -1188,6 +1233,11 @@ html.noanim .asset-flip.spin{animation:none}
 #notifyPanel.open .notify-head .pv-caret{transform:rotate(180deg)}
 .notify-head:active{opacity:.75}
 #notifySummary{font-weight:600;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Token 健康同样默认收起（用户 m06523）：7 行全铺太占地方。
+   复用 .notify-head 的手感，只把「展开时的下边距」接到自己的面板上。 */
+#thPanel:not(.open) .notify-head{margin-bottom:0}
+#thPanel.open .notify-head{margin-bottom:12px}
+#thPanel.open .notify-head .pv-caret{transform:rotate(180deg)}
 /* 通用折叠容器：height 由 JS 写成具体 px，0 与内容高之间过渡 */
 .fold{overflow:hidden;height:0;opacity:0;
   transition:height .34s cubic-bezier(.22,.85,.28,1),opacity .26s ease}
@@ -1200,13 +1250,20 @@ html[data-theme="mint"] .jitter-lock{background:rgba(10,120,85,.08);color:#4a736
 html[data-theme="light"] .jitter-field.locked #schedJitter::-webkit-slider-thumb{background:#fff;border-color:#8b96ab}
 html[data-theme="mint"] .jitter-field.locked #schedJitter::-webkit-slider-thumb{background:#fff;border-color:#7fa392}
 
-/* ===== 水波反馈（用户 m14034）=====
-   圆心取手指落点，按住移动时圆心跟着手指走（不改控件中心）；
-   按下时从触点向外扩散，松手后继续外扩并淡出。
-   波纹层挂在 body 上（position:fixed），所以不被控件 overflow/圆角裁切，
+/* ===== 水波反馈（用户 m14034；m06176 改成「只在按键内部扩散」）=====
+   圆心取手指落点，按住移动时圆心跟着手指走（不改控件中心）。
+   用户 m06176：以前波纹直接挂在 body 上（position:fixed 的圆形），不受控件圆角裁切，
+   长按「一键全部签到」时蓝光会溢到按键外面一圈，看着像漏光。
+   现在拆两层，光只在按键内部扩散并填满：
+     · .ripple-clip —— 固定盖在控件矩形上，圆角与尺寸抄控件的，overflow:hidden；
+     · .ripple      —— 圆形渐变，放在裁切层里，按触点坐标定位。
+   两层都挂 body（position:fixed），不改控件自身的 position/overflow，
    也不受 .asset-card 的 perspective 影响。 */
-.ripple{position:fixed;left:0;top:0;width:96px;height:96px;border-radius:50%;
-  pointer-events:none;z-index:70;opacity:0;transform:scale(.34);transform-origin:50% 50%;
+.ripple-clip{position:fixed;pointer-events:none;z-index:70;overflow:hidden;
+  will-change:opacity;contain:layout style paint}
+.ripple-clip.gone{opacity:0;transition:opacity .2s ease}
+.ripple{position:absolute;left:0;top:0;width:96px;height:96px;border-radius:50%;
+  pointer-events:none;opacity:0;transform:scale(.34);transform-origin:50% 50%;
   background:radial-gradient(circle,rgba(150,180,255,.55) 0%,rgba(120,150,255,.24) 42%,rgba(120,150,255,0) 72%);
   transition:transform .5s cubic-bezier(.16,1,.3,1),opacity .2s ease;
   will-change:transform,opacity;contain:layout style paint}
@@ -1217,7 +1274,7 @@ html[data-theme="light"] .ripple{
   background:radial-gradient(circle,rgba(60,100,220,.34) 0%,rgba(60,100,220,.14) 42%,rgba(60,100,220,0) 72%)}
 html[data-theme="mint"] .ripple{
   background:radial-gradient(circle,rgba(10,150,110,.34) 0%,rgba(10,150,110,.14) 42%,rgba(10,150,110,0) 72%)}
-html.noanim .ripple{display:none}
+html.noanim .ripple-clip{display:none}
 
 /* ===== 齿轮入口（用户 m14411 / m14954）=====
    顶栏右上角原来的「主题」按钮改成齿轮 → 点它直接进配置页。

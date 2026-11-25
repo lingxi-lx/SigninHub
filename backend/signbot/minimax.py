@@ -139,7 +139,7 @@ def _resolve(cfg: dict) -> dict:
 def _fingerprint_seed(cfg: dict, r: dict = None) -> str:
     """指纹种子：优先 userId，其次 accessToken 前 32 位。
 
-    以前 uuid 与 device_id 的兜底值是写死的常量（"一个写死的 uuid / deviceId"），
+    以前 uuid 与 device_id 的兜底值是写死的常量（一个写死的 uuid / deviceId），
     所有用户共用同一个设备指纹——上游只要按 uuid 聚合，就能把所有人的签到
     看成一家的，风控也更容易把整批一起打死。这里改成按账号稳定派生：
     同一个人每次算出来一样（不破坏「设备不变」的语义），不同人不会撞。

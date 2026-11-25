@@ -92,8 +92,17 @@ data class TraeAccount(
      * `LocalCheckin.jwtUid(token)` 补。
      */
     val uid: String = "",
+    /**
+     * 用户自定义的显示名（用户 m02619）。
+     *
+     * 与 [nickname] 分开存：nickname 是上游接口返回的、每次登录都会被刷新，
+     * 用户改的名字必须不被后续 upsert 覆盖，所以独立一个字段。
+     * 留空 = 用自动名（[displayName] 的老逻辑）。
+     */
+    val alias: String = "",
 ) {
     fun displayName(): String = when {
+        alias.isNotBlank() -> alias
         phone.isNotBlank() -> phone
         nickname.isNotBlank() -> nickname
         token.isNotBlank() -> "Trae · " + token.takeLast(6)
@@ -123,6 +132,7 @@ data class TraeAccount(
         put("nickname", nickname)
         put("phone", phone)
         put("uid", uid)
+        put("alias", alias)
     }
 
     companion object {
@@ -157,6 +167,7 @@ data class TraeAccount(
             uid = o.optString("uid", "").ifBlank {
                 if (tok.length >= 10) LocalCheckin.jwtUid(tok) else ""
             },
+            alias = o.optString("alias", ""),
             )
         }
     }
@@ -220,6 +231,9 @@ object TraeAccountStore {
                 nickname = acc.nickname.ifBlank { old.nickname },
                 phone = acc.phone.ifBlank { old.phone },
                 uid = acc.uid.ifBlank { old.uid },
+                // 自定义名（用户 m02619）：登录/刷新流程带不上它，命中已有账号时沿用旧值，
+                // 否则用户改过的名字会被下一次登录冲掉。清空改名走 update()。
+                alias = acc.alias.ifBlank { old.alias },
             ).also { list[idx] = it }
         } else {
             list.add(acc); acc
@@ -317,8 +331,11 @@ data class QoderAccount(
     val nickname: String = "",
     /** 手机号打码串（用户 m16555）。Qoder 没有下发表单手机号，能读到才有值，见 TraeAccount 注释。 */
     val phone: String = "",
+    /** 用户自定义的显示名（用户 m02619），留空则用自动名，见 TraeAccount.alias 注释。 */
+    val alias: String = "",
 ) {
     fun displayName(): String = when {
+        alias.isNotBlank() -> alias
         phone.isNotBlank() -> phone
         nickname.isNotBlank() -> nickname
         uid.isNotBlank() -> "Qoder · " + uid.take(8)
@@ -344,6 +361,7 @@ data class QoderAccount(
         put("streakDays", streakDays); put("usedPoints", usedPoints)
         put("nickname", nickname)
         put("phone", phone)
+        put("alias", alias)
     }
 
     companion object {
@@ -372,6 +390,7 @@ data class QoderAccount(
             refreshRaw = refRaw,
             nickname = o.optString("nickname", ""),
             phone = o.optString("phone", ""),
+            alias = o.optString("alias", ""),
             )
         }
     }
@@ -424,6 +443,7 @@ object QoderAccountStore {
                 streakDays = old.streakDays, usedPoints = old.usedPoints,
                 nickname = acc.nickname.ifBlank { old.nickname },
                 phone = acc.phone.ifBlank { old.phone },
+                alias = acc.alias.ifBlank { old.alias },
             ).also { list[idx] = it }
         } else {
             list.add(acc); acc
@@ -472,8 +492,11 @@ data class MmAccount(
     val nickname: String = "",
     /** 手机号打码串（用户 m16555）。MiniMax 无昵称/手机号接口，只能登录时顺手读，见 TraeAccount 注释。 */
     val phone: String = "",
+    /** 用户自定义的显示名（用户 m02619），留空则用自动名，见 TraeAccount 的 alias 注释。 */
+    val alias: String = "",
 ) {
     fun displayName(): String = when {
+        alias.isNotBlank() -> alias
         phone.isNotBlank() -> phone
         nickname.isNotBlank() -> nickname
         userId.isNotBlank() -> "MiniMax · " + userId.take(8)
@@ -496,6 +519,7 @@ data class MmAccount(
         put("streakDays", streakDays); put("usedPoints", usedPoints)
         put("nickname", nickname)
         put("phone", phone)
+        put("alias", alias)
     }
 
     companion object {
@@ -518,6 +542,7 @@ data class MmAccount(
             tokenRaw = tokRaw,
             nickname = o.optString("nickname", ""),
             phone = o.optString("phone", ""),
+            alias = o.optString("alias", ""),
             )
         }
     }
@@ -567,6 +592,7 @@ object MmAccountStore {
                 streakDays = old.streakDays, usedPoints = old.usedPoints,
                 nickname = acc.nickname.ifBlank { old.nickname },
                 phone = acc.phone.ifBlank { old.phone },
+                alias = acc.alias.ifBlank { old.alias },
             ).also { list[idx] = it }
         } else {
             list.add(acc); acc
@@ -593,7 +619,7 @@ object MmAccountStore {
  *
  * 此前华为是单账号：一份 Cookie = 一个会话，换号就是覆盖。之所以能做多账号，
  * 是因为华为的凭据**就是整条 Cookie**（`devclouddevuibjJ_SESSION_ID` +
- * `agencyID` + `devclouddevuibtcftk`），每个账号一套互不干扰，没有设备指纹绑定 ——
+ * `agencyID` + `devclouddevuibjtcftk`），每个账号一套互不干扰，没有设备指纹绑定 ——
  * 不像 Trae 有 `x-device-id`、Qoder 有 `Cosy-MachineId` 这类跨账号必须唯一的字段。
  *
  * ## 账号身份（BUGS-v2.46 P1）
@@ -615,6 +641,14 @@ object MmAccountStore {
 data class HwAccount(
     val id: String,
     val cookie: String = "",
+    /**
+     * auth 域（`auth.huaweicloud.com`）Cookie（V2.79 加）—— 静默重登的钥匙。
+     *
+     * 每个华为账号在 auth 域都有自己的一份登录凭据，所以**必须按账号存**，
+     * 不能共用设置页里那一份（多账号时共用会把 A 号的凭据拿去给 B 号续期）。
+     * 留空则该账号走不了自动续期，只能手动重登。
+     */
+    val authCookie: String = "",
     val lastStatus: String = "",
     val lastMessage: String = "",
     val lastCheckAt: Long = 0L,
@@ -623,10 +657,28 @@ data class HwAccount(
     val usedPoints: Int = -1,
     /** 读进来的原始密文，用于「解不开时原样写回」（N1，BUGS-v2.1），见 TraeAccount 注释。 */
     val cookieRaw: String = "",
+    /**
+     * auth 域 Cookie 的原始密文（BUGS-v2.63-290 P3-4）。
+     *
+     * 与 [cookieRaw] 同理：Keystore 暂时不可用（设备刚开机未解锁、系统密钥失效、
+     * 个别 ROM 异常）时 `encryptOrNull` 返回 null，以前那行会兜成 ""，
+     * 把磁盘上原有的 auth 密文覆盖成空 —— 之后华为会话过期、`HwRenew` 没有
+     * auth 域凭据可用，静默重登永久失效，用户只能重新扫码。
+     */
+    val authCookieRaw: String = "",
     /** 备注名（华为没有昵称/手机号接口，只能用户自己填，留空则显示短 id）。 */
     val nickname: String = "",
+    /**
+     * 用户自定义的显示名（用户 m02619）。
+     *
+     * 华为这里与 [nickname] 语义重合（两者都只能手填），保留两个字段是为了跟其它三家
+     * 的 `displayName()` 优先级链一致；[alias] 优先，[nickname] 作为历史数据兜底
+     * （V2.67 之前用户填的备注都写在 nickname 里）。
+     */
+    val alias: String = "",
 ) {
     fun displayName(): String = when {
+        alias.isNotBlank() -> alias
         nickname.isNotBlank() -> nickname
         else -> "华为 · " + shortId()
     }
@@ -647,10 +699,13 @@ data class HwAccount(
         put("id", id)
         // 整条 Cookie 就是凭据，落盘前加密（见 TraeAccount.toJson 注释）
         put("cookie", SecretBox.encryptKeep(cookie, cookieRaw))
+        // 加密失败（Keystore 暂不可用）必须保留原密文，不能写成空串 —— 见 authCookieRaw 注释
+        put("authCookie", SecretBox.encryptKeep(authCookie, authCookieRaw))
         put("lastStatus", lastStatus); put("lastMessage", lastMessage)
         put("lastCheckAt", lastCheckAt); put("totalPoints", totalPoints)
         put("streakDays", streakDays); put("usedPoints", usedPoints)
         put("nickname", nickname)
+        put("alias", alias)
     }
 
     companion object {
@@ -703,9 +758,11 @@ data class HwAccount(
         fun fromJson(o: JSONObject): HwAccount {
             val raw = o.optString("cookie", "")
             val ck = SecretBox.decryptOrEmpty(raw)
+            val authRaw = o.optString("authCookie", "")
             return HwAccount(
                 id = o.optString("id", "").ifBlank { AccountIds.stable(identityOf(ck)) },
                 cookie = ck,
+                authCookie = SecretBox.decryptOrEmpty(authRaw),
                 lastStatus = o.optString("lastStatus", ""),
                 lastMessage = o.optString("lastMessage", ""),
                 lastCheckAt = o.optLong("lastCheckAt", 0L),
@@ -713,7 +770,9 @@ data class HwAccount(
                 streakDays = o.optInt("streakDays", -1),
                 usedPoints = o.optInt("usedPoints", -1),
                 cookieRaw = raw,
+                authCookieRaw = authRaw,
                 nickname = o.optString("nickname", ""),
+                alias = o.optString("alias", ""),
             )
         }
     }
@@ -769,10 +828,12 @@ object HwAccountStore {
             acc.copy(
                 id = old.id,
                 cookie = acc.cookie.ifBlank { old.cookie },
+                authCookie = acc.authCookie.ifBlank { old.authCookie },
                 lastStatus = old.lastStatus, lastMessage = old.lastMessage,
                 lastCheckAt = old.lastCheckAt, totalPoints = old.totalPoints,
                 streakDays = old.streakDays, usedPoints = old.usedPoints,
                 nickname = acc.nickname.ifBlank { old.nickname },
+                alias = acc.alias.ifBlank { old.alias },
             ).also { list[idx] = it }
         } else {
             list.add(acc); acc

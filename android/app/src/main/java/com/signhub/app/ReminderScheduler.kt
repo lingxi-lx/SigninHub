@@ -47,11 +47,15 @@ object ReminderScheduler {
     /**
      * 提醒触发后由 [ReminderReceiver] 调用，续排下一天。
      * 单独一个方法是为了让「已关闭提醒」时不再续排 —— 否则用户关掉后第二天还会响。
+     *
+     * V2.63/288（BUGS-v2.63-287 P2）：改成 `suspend`，去掉内部的 `runBlocking`。
+     * 原来这里是 `runBlocking { SettingsStore.flow(ctx).first() }`，而唯一的调用方
+     * [ReminderReceiver.onReceive] 跑在主线程 —— 冷启动时 DataStore 要初始化、
+     * 读文件、解析全部 key，全在主线程，10 秒预算一超就 ANR 或广播被杀，
+     * 续排不执行、提醒链条断掉。调用方已改成 `goAsync()` + `Dispatchers.IO` 协程。
      */
-    fun scheduleNext(ctx: Context) {
-        val s = runCatching {
-            kotlinx.coroutines.runBlocking { SettingsStore.flow(ctx).first() }
-        }.getOrNull()
+    suspend fun scheduleNext(ctx: Context) {
+        val s = runCatching { SettingsStore.flow(ctx).first() }.getOrNull()
         if (s == null || !s.reminderEnabled) return
         val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val (hour, min) = parse(s.reminderTime)

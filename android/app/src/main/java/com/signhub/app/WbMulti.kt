@@ -54,8 +54,17 @@ data class WbAccount(
      * （uid 是完整 UUID，直接显示会把卡片撑爆，v2.21 在真机上出现过）。
      */
     val phone: String = "",
+    /**
+     * 用户自定义的显示名（用户 m02619）。
+     *
+     * 不能复用 [nickname]：那个字段是 OAuth `login/account` 返回的上游昵称，
+     * 每次登录/刷新都会被覆盖。用户改的名字必须独立存，`upsert` 命中时也不能被冲掉。
+     * 留空 = 用自动名（[displayName] 的老逻辑）。
+     */
+    val alias: String = "",
 ) {
     fun displayName(): String = when {
+        alias.isNotBlank() -> alias
         phone.isNotBlank() -> phone
         nickname.isNotBlank() -> nickname
         email.isNotBlank() -> email
@@ -75,6 +84,7 @@ data class WbAccount(
         put("lastStatus", lastStatus); put("lastMessage", lastMessage); put("lastCheckAt", lastCheckAt)
         put("totalPoints", totalPoints); put("streakDays", streakDays)
         put("phone", phone)
+        put("alias", alias)
     }
 
     companion object {
@@ -108,6 +118,7 @@ data class WbAccount(
                 accessTokenRaw = atRaw,
                 refreshTokenRaw = rtRaw,
                 phone = o.optString("phone", ""),
+                alias = o.optString("alias", ""),
             )
         }
     }
@@ -178,6 +189,9 @@ object WbAccountStore {
                 // 手机号/昵称是登录后异步补的：这次没带就沿用旧值，别把已取到的抹掉
                 phone = acc.phone.ifBlank { old.phone },
                 nickname = acc.nickname.ifBlank { old.nickname },
+                // 自定义名同理：登录流程永远带不上它，命中已有账号必须沿用旧值，
+                // 否则用户改过的名字会被下一次登录冲掉。清空改名走 update()。
+                alias = acc.alias.ifBlank { old.alias },
             )
         } else list.add(acc)
         save(ctx, list)

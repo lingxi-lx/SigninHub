@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Android 11+ 包可见性：AutoClickService 需按包名过滤事件 -->
+    <!--
+      Android 11+ 包可见性。
+      原来第一段注释写的是「AutoClickService 需按包名过滤事件」，但无障碍服务在
+      V2.62 修 H2 时已整个删除，这里的 MAIN/LAUNCHER 查询只服务于「打开官方 App」
+      这类跳转，注释已改。
+    -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
@@ -86,11 +91,14 @@
             </intent-filter>
         </activity>
 
-        <!-- 旧的原生 Compose 界面（保留备用，不在桌面显示） -->
-        <activity
-            android:name=".MainActivity"
-            android:exported="false"
-            android:label="签到中心（原生）" />
+        <!--
+          V2.63：删掉了旧的「原生 Compose 界面」（MainActivity）。
+          它是 exported=false 且全仓零 Intent 引用，从 V2.5x 起就没有入口 —— 桌面
+          launcher 一直是 WebUiActivity。跟着一起删的还有只服务它的 MainViewModel.kt /
+          ApiClient.kt / Models.kt，以及它里面那块「手机侧兜底：无障碍自动点击」的说明
+          和「打开无障碍设置」按钮（V2.62 修 H2 时 AutoClickService 已整个移除，
+          那个按钮点进去系统列表里根本没有本 App，属于误导）。
+        -->
 
         <!-- App 内登录页：登录后自动抓取 WorkBuddy accessToken / Trae Cloud-IDE-Token，纯手机 -->
         <activity

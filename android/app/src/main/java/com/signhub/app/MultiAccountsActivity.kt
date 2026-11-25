@@ -383,6 +383,13 @@ class MultiAccountsActivity : Activity() {
                 it.animate().alpha(0.6f).setDuration(120).start()
                 checkOne(acc.id, acc.name)
             })
+            btns.addView(pill(text = "改名",
+                colors = listOf(Color.TRANSPARENT, Color.TRANSPARENT),
+                textColor = Color.parseColor("#C7D2FF"),
+                widthDp = 74, endMarginDp = 10,
+                stroke = Color.parseColor("#6C8CFF55")) {
+                rename(acc.id, acc.name)
+            })
             btns.addView(pill(text = "删除",
                 colors = listOf(Color.TRANSPARENT, Color.TRANSPARENT),
                 textColor = Color.parseColor("#FFB3BF"),
@@ -421,7 +428,7 @@ class MultiAccountsActivity : Activity() {
             P_QD -> "推荐填 drt- 开头的 refreshToken（有效期一年，只填它也能签到）；\n" +
                 "也可以填 dt- 开头的 accessToken（30 天过期）。"
             P_HW -> "填整串会话 Cookie（必须含 devclouddevuibjJ_SESSION_ID，\n" +
-                "通常还有 agencyID 与 devclouddevuibtcftk）。\n" +
+                "通常还有 agencyID 与 devclouddevuibjtcftk）。\n" +
                 "浏览器 F12 → Application → Cookies 里整行复制即可。\n" +
                 "注意：华为的会话 Cookie 静置 30~60 分钟会过期。"
             else -> "填 mmoat_ 开头的 accessToken（约 60 个字符）。"
@@ -444,21 +451,32 @@ class MultiAccountsActivity : Activity() {
             else -> "备注（可选）"
         }
 
+        // MiniMax 的第三栏被 device_id 占掉了，别名只能另开一栏（用户 m02619）
+        val fields = buildList {
+            add(SignDialog.Field(f1, multiline = true))
+            add(SignDialog.Field(f2))
+            add(SignDialog.Field(f3))
+            if (provider == P_MM) add(SignDialog.Field("备注（可选，随时可在卡片上改）"))
+        }
+
         SignDialog.input(
             this,
             kicker = "MANUAL",
             title = "手动添加账号",
             subtitle = hint,
-            fields = listOf(
-                SignDialog.Field(f1, multiline = true),
-                SignDialog.Field(f2),
-                SignDialog.Field(f3),
-            ),
+            fields = fields,
             validate = { v -> if (v[0].length < 10) "凭据太短，至少 10 个字符" else null },
         ) { v ->
             val a = v[0]
             val b = v[1]
             val c = v[2]
+            val alias = when (provider) {
+                // 华为的第二栏本来就是「备注」，第三栏是占位；沿用老位置别让用户改习惯
+                P_HW -> b.trim().take(24)
+                // MiniMax 的第三栏是 device_id，别名在第四栏
+                P_MM -> v.getOrElse(3) { "" }.trim().take(24)
+                else -> c.trim().take(24)
+            }
             when (provider) {
                 P_TRAE -> {
                     val isJwt = a.startsWith("eyJ") && a.count { it == '.' } == 2
@@ -476,6 +494,8 @@ class MultiAccountsActivity : Activity() {
                         token = if (isJwt) a else "",
                         session = if (isJwt) "" else a,
                         deviceId = dev,
+                        // 第三栏是「备注」，原来被丢掉了（用户 m02619 要求可自定义名称）
+                        alias = alias,
                     ))
                 }
                 P_QD -> {
@@ -485,6 +505,8 @@ class MultiAccountsActivity : Activity() {
                     QoderAccountStore.upsert(this, QoderAccount(
                         id = AccountIds.stable(at, rt),
                         token = at, refresh = rt, uid = "", machineId = "", region = "cn",
+                        // 第三栏是「备注」，原来被丢掉了（用户 m02619）
+                        alias = alias,
                     ))
                 }
                 P_HW -> {
@@ -492,7 +514,9 @@ class MultiAccountsActivity : Activity() {
                         // 身份键优先 agencyID（BUGS-v2.46 P1），与 LoginWebActivity 同一口径
                         id = AccountIds.stable(HwAccount.identityOf(a)),
                         cookie = a,
-                        nickname = b.trim(),
+                        // 华为原来就把备注写 nickname，这里两者都填，保证老逻辑与 alias 一致
+                        nickname = alias,
+                        alias = alias,
                     ))
                     // 手动粘贴这条路没有 probe 环节，只能靠 agencyID 这个「真登录才发」的
                     // 附属 cookie 下结论（BUGS-v2.46 P2）。没有它就不写结论 ——
@@ -503,6 +527,7 @@ class MultiAccountsActivity : Activity() {
                     id = AccountIds.stable(a, if (b.matches(Regex("\\d+"))) b else ""),
                     token = a, userId = if (b.matches(Regex("\\d+"))) b else "",
                     deviceId = if (c.isNotBlank()) c else "",
+                    alias = alias,
                 ))
             }
             toast("已添加")
@@ -589,17 +614,24 @@ class MultiAccountsActivity : Activity() {
                 P_QD -> {
                     val acc = QoderAccountStore.all(this).firstOrNull { it.id == id }
                     if (acc == null) "账号不存在" else {
+                        // BUGS-v2.63-287 P3-1：续期换出的新 (token, refresh) 必须回写，
+                        // 否则下次手动签到又拿旧 drt- 去换。
+                        var qdTok: String? = null
+                        var qdRef: String? = null
                         val r = CheckinGate.run("qoder", acc.id) {
                             runBlocking {
                                 LocalCheckin.qoder(acc.region.ifBlank { "cn" }, acc.token,
-                                    acc.uid, acc.machineId, "", acc.refresh)
+                                    acc.uid, acc.machineId, "", acc.refresh,
+                                    onRenewed = { t, rf -> qdTok = t; qdRef = rf })
                             }
                         }
                         QoderAccountStore.update(this, acc.copy(
                             lastStatus = r.status, lastMessage = r.message,
                             lastCheckAt = System.currentTimeMillis(),
                             totalPoints = r.totalPoints, streakDays = r.streakDays,
-                            usedPoints = r.usedPoints))
+                            usedPoints = r.usedPoints,
+                            token = qdTok ?: acc.token,
+                            refresh = qdRef ?: acc.refresh))
                         saveRecord(r, acc.id)
                         r.message
                     }
@@ -702,17 +734,23 @@ class MultiAccountsActivity : Activity() {
                     P_QD -> {
                         val a = QoderAccountStore.all(this).firstOrNull { it.id == acc.id }
                         if (a == null) false else {
+                            // BUGS-v2.63-287 P3-1：批量签到时同样回写续期结果
+                            var qdTok: String? = null
+                            var qdRef: String? = null
                             val r = CheckinGate.run("qoder", a.id) {
                                 runBlocking {
                                     LocalCheckin.qoder(a.region.ifBlank { "cn" }, a.token,
-                                        a.uid, a.machineId, "", a.refresh)
+                                        a.uid, a.machineId, "", a.refresh,
+                                        onRenewed = { t, rf -> qdTok = t; qdRef = rf })
                                 }
                             }
                             QoderAccountStore.update(this, a.copy(
                                 lastStatus = r.status, lastMessage = r.message,
                                 lastCheckAt = System.currentTimeMillis(),
                                 totalPoints = r.totalPoints, streakDays = r.streakDays,
-                                usedPoints = r.usedPoints))
+                                usedPoints = r.usedPoints,
+                                token = qdTok ?: a.token,
+                                refresh = qdRef ?: a.refresh))
                             saveRecord(r, a.id)
                             r.status == "success" || r.status == "already"
                         }
@@ -763,6 +801,54 @@ class MultiAccountsActivity : Activity() {
                 refreshList()
             }
         }.start()
+    }
+
+    /**
+     * 改显示名（用户 m02619）。
+     *
+     * 只写 `alias` 字段，不动 `nickname`（那是上游接口回来的，下次登录会被覆盖）。
+     * 留空 = 清掉自定义名，回到自动名。四家各走各的 Store.update()，
+     * 因为 update 是「按 id 整条替换」，只改 alias 不会碰凭据。
+     */
+    private fun rename(id: String, current: String) {
+        SignDialog.input(
+            this,
+            kicker = "RENAME",
+            title = "自定义名称",
+            subtitle = "起一个自己好认的名字，比如「工作号」「小号」。\n留空保存则恢复自动名称（当前显示：$current）。",
+            fields = listOf(SignDialog.Field("名称", initial = current.takeIf { it != autoNameOf(id) } ?: "")),
+            okText = "保存",
+        ) { v ->
+            val alias = v[0].trim().take(24)
+            val ok = when (provider) {
+                P_TRAE -> TraeAccountStore.all(this).firstOrNull { it.id == id }?.let {
+                    TraeAccountStore.update(this, it.copy(alias = alias)); true
+                } ?: false
+                P_QD -> QoderAccountStore.all(this).firstOrNull { it.id == id }?.let {
+                    QoderAccountStore.update(this, it.copy(alias = alias)); true
+                } ?: false
+                P_HW -> HwAccountStore.all(this).firstOrNull { it.id == id }?.let {
+                    HwAccountStore.update(this, it.copy(alias = alias)); true
+                } ?: false
+                else -> MmAccountStore.all(this).firstOrNull { it.id == id }?.let {
+                    MmAccountStore.update(this, it.copy(alias = alias)); true
+                } ?: false
+            }
+            if (ok) {
+                refreshList()
+                toast(if (alias.isBlank()) "已恢复自动名称" else "已改名为「$alias」")
+            } else {
+                toast("账号不存在，请返回重进")
+            }
+        }
+    }
+
+    /** 该账号的自动名（把 alias 当成空算出来的名字），用来判断输入框要不要预填。 */
+    private fun autoNameOf(id: String): String = when (provider) {
+        P_TRAE -> TraeAccountStore.all(this).firstOrNull { it.id == id }?.copy(alias = "")?.displayName() ?: ""
+        P_QD -> QoderAccountStore.all(this).firstOrNull { it.id == id }?.copy(alias = "")?.displayName() ?: ""
+        P_HW -> HwAccountStore.all(this).firstOrNull { it.id == id }?.copy(alias = "")?.displayName() ?: ""
+        else -> MmAccountStore.all(this).firstOrNull { it.id == id }?.copy(alias = "")?.displayName() ?: ""
     }
 
     private fun confirmDelete(id: String, name: String) {

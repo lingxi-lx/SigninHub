@@ -49,6 +49,64 @@ class LocalApi(private val ctx: Context) {
                 }
             }
         } catch (_: Exception) {}
+        // V2.78（用户 m05383「主账号签不上、账号 2 能签」）：把主账号与多账号列表里
+        // 「同一个上游 Trae 号」的条目合并掉，顺便用新鲜那份凭据救活主账号。
+        try { collapseMainTrae() } catch (_: Exception) {}
+    }
+
+    /**
+     * V2.78：合并「主账号 + 列表里同一个 uid 的 Trae 条目」。
+     *
+     * 背景（用户 m05383）：旧版 [LoginWebActivity.persistTrae] 在多账号通道里只判
+     * session/token 是否完全相同。同一个 Trae 号重新登录一次会换一枚 token + 一条新
+     * session，于是被判成「新账号」追加进列表；主账号仍旧握着早已失效的旧凭据。
+     * 界面上就出现两张指着同一个上游号的卡：主账号那张每次签到必然失败（红叉）、
+     * 列表里那张成功（绿勾），而且两张卡的余额一模一样（本来就是同一个号）。
+     *
+     * 这里在启动时自愈一次：
+     * ① 列表里 uid 与主账号相同的条目 = 同一个号 → 一律从列表移除（不再多一张卡）；
+     * ② 若主账号凭据已失效（既没有 session，token 也过期/为空），把列表那条的新凭据
+     *    接过来写回主账号 —— 用户不需要重新登录就能恢复签到；
+     * ③ 设备号沿用主账号已有的合法号（设备号必须永久稳定，换号 = 换设备 → 9074）。
+     *
+     * uid 取不到（老版本没记、或 token 不是 JWT）时**什么都不做** —— 判不了就别乱合并，
+     * 宁可多一张卡，也不能把两个真账号并成一个（漏签比多签更严重）。
+     */
+    private fun collapseMainTrae() {
+        val s0 = kotlinx.coroutines.runBlocking { SettingsStore.flow(ctx).first() }
+        val mainUid = if (s0.traeToken.length >= 10) LocalCheckin.jwtUid(s0.traeToken) else ""
+        if (mainUid.isBlank()) return
+        val all = TraeAccountStore.all(ctx)
+        val same = all.filter { it.uid.isNotBlank() && it.uid == mainUid }
+        if (same.isEmpty()) return
+
+        val now = System.currentTimeMillis() / 1000
+        val mainExp = LocalCheckin.jwtExpiresAt(s0.traeToken)
+        val mainAlive = s0.traeSession.isNotBlank() || (mainExp > 0 && mainExp > now + 60)
+
+        // 挑一份最新鲜的凭据来刷新主账号：优先「有 session 的」（session 能自动续期），
+        // 其次 token 剩余有效期最长的。
+        val donor = same
+            .filter { it.token.isNotBlank() || it.session.isNotBlank() }
+            .maxByOrNull { if (it.session.isNotBlank()) Long.MAX_VALUE else LocalCheckin.jwtExpiresAt(it.token) }
+
+        // 只在「主账号凭据已失效」时才接管 donor 的凭据 —— 主账号还活着就说明它能自己签，
+        // 不覆盖（避免把一份能用的 session 换成不确定的）。
+        if (!mainAlive && donor != null) {
+            kotlinx.coroutines.runBlocking {
+                SettingsStore.save(
+                    ctx,
+                    s0.copy(
+                        traeToken = donor.token.ifBlank { s0.traeToken },
+                        traeSession = donor.session.ifBlank { s0.traeSession },
+                    ),
+                )
+            }
+        }
+        // 这些条目与主账号是同一个上游号（uid 相同）→ 一律移除：主账号已经承载了这个号，
+        // 再留一条只会多出一张「余额一样、状态却不同」的卡（用户 m05383 看到的就是这个）。
+        // 凭据已经在上面按需接走，这里移除不会丢凭据。
+        same.forEach { TraeAccountStore.remove(ctx, it.id) }
     }
 
     companion object {
@@ -258,13 +316,19 @@ class LocalApi(private val ctx: Context) {
     /** /api/config 异常时的最小可用配置：5 个 provider 全 enabled、凭据留空。 */
     private fun configFallback(reason: String): String {
         val providers = JSONObject()
-        listOf(
+        val fams = mutableListOf(
             "workbuddy" to "wb",
             "traesolo" to "trae",
             "qoder" to "qoder",
             "minimax" to "minimax",
             "huawei" to "huawei",
-        ).forEach { (k, mode) ->
+            "zhipu" to "zhipu",
+            "qianfan" to "qianfan",
+        )
+        // 豆包 V2.75 起搁置（DoubaoWebCheckin.ENABLED=false）：兜底配置里也不列，
+        // 否则电脑端/前端会多出一张点了就报错的空卡片。
+        if (DoubaoWebCheckin.ENABLED) fams.add("doubao" to "doubao")
+        fams.forEach { (k, mode) ->
             providers.put(k, JSONObject().apply {
                 put("enabled", true)
                 put("mode", mode)
@@ -274,6 +338,9 @@ class LocalApi(private val ctx: Context) {
                     "qoder" -> put("qoder", JSONObject().put("region", "cn"))
                     "minimax" -> put("minimax", JSONObject())
                     "huawei" -> put("huawei", JSONObject())
+                    "doubao" -> put("doubao", JSONObject())
+                    "zhipu" -> put("zhipu", JSONObject())
+                    "qianfan" -> put("qianfan", JSONObject())
                     else -> {}
                 }
             })
@@ -647,7 +714,6 @@ class LocalApi(private val ctx: Context) {
         val traeReady = isReady("traesolo", s)
         val traeIssues = buildList {
             if (!traeHasAuth) add("缺少凭据：点「登录主账号」，或在设置里填 X-Cloudide-Session")
-            else if (!traeReady) add("缺少 x-device-id（16 位数字）")
         }
         rows.put(providerRow(
             key = "traesolo", label = "Trae Solo", mode = "trae",
@@ -746,7 +812,71 @@ class LocalApi(private val ctx: Context) {
             // 字段名保留 portal_ok（前端与电脑端都在读），语义已改为
             // 「积分能不能读」= 「会话是否可用」。
             row.put("portal_ok", hwUsableAccs.isNotEmpty())
+            // V2.79：会话过期后能否自动续期（auth 域凭据在 = 能，全程不用输手机号）。
+            row.put("auto_renew", s.hwAuthCookie.isNotBlank() || hwAccs.any { it.authCookie.isNotBlank() })
         })
+
+        // 智谱清言（V2.76 接入）：纯 HTTP 签到，签名可本地算。
+        //
+        // 就绪判据必须用 ZhipuCheckin.hasSession（refresh token 存在 **且** 不是游客）：
+        // 游客态也有一套完整 token，只看「有没有 chatglm_token」会把游客认成已登录。
+        // 这里刻意不真打上游：/api/status 每 25 秒跑一次，每次都 refresh 会白耗配额。
+        val zpReady = isReady("zhipu", s)
+        val zpIssues = buildList {
+            if (s.zpCookie.isBlank())
+                add("缺少 Cookie：点「登录智谱清言」在站内登录一次即可自动采集")
+            else if (!zpReady)
+                add("这份 Cookie 是游客态（JWT 里 is_guest=true）：请重新登录一次")
+        }
+        rows.put(providerRow(
+            key = "zhipu", label = "智谱清言", mode = "zhipu",
+            ready = zpReady, issues = zpIssues,
+            rec = recs["zhipu"], day = day, acctCount = if (zpReady) 1 else 0,
+            accts = if (zpReady) listOf(
+                AcctRef(key = HistoryStore.DEFAULT_ACCOUNT, label = "主账号", sub = "chatglm.cn")
+            ) else emptyList(),
+        ))
+
+        // 百度智能云 / 百度搭子 DuMate（V2.76 接入）：Cookie + csrftoken 纯 HTTP。
+        val qfReady = isReady("qianfan", s)
+        val qfIssues = buildList {
+            if (s.qfCookie.isBlank())
+                add("缺少 Cookie：点「登录百度智能云」在站内登录一次即可自动采集")
+            else if (!qfReady)
+                add("Cookie 里没有 BDUSS / bce-user-info：这是游客态，请重新登录一次")
+        }
+        rows.put(providerRow(
+            key = "qianfan", label = "百度千帆", mode = "qianfan",
+            ready = qfReady, issues = qfIssues,
+            rec = recs["qianfan"], day = day, acctCount = if (qfReady) 1 else 0,
+            accts = if (qfReady) listOf(
+                AcctRef(key = HistoryStore.DEFAULT_ACCOUNT, label = "主账号", sub = "bce.baidu.com")
+            ) else emptyList(),
+        ))
+
+        // 豆包（V2.66 重新接入；**V2.75 起搁置** —— DoubaoWebCheckin.ENABLED=false 时整块跳过）。
+        //
+        // 与华为的区别：豆包游客态一个 cookie 都拿不到（实测），所以
+        // 「Cookie 里有 sessionid」本身就是可信的就绪判据，不需要额外的 probe 结论表。
+        // 这里也刻意不真打上游：/api/status 每 25 秒跑一次，每次都打会白白耗会话。
+        //
+        // 搁置原因见 DoubaoWebCheckin.ENABLED 的注释：三个公共 query 补齐后
+        // landing/checkin 仍返 710010702，需真实可签账号才能继续验，手上没有。
+        if (DoubaoWebCheckin.ENABLED) {
+            val dbReady = s.dbCookie.isNotBlank() && DoubaoWebCheckin.hasSession(s.dbCookie)
+            val dbIssues = buildList {
+                if (s.dbCookie.isBlank())
+                    add("缺少豆包 Cookie：点「登录豆包」在站内登录一次即可自动采集")
+                else if (!dbReady)
+                    add("Cookie 里没找到 sessionid / sid_tt / uid_tt / sid_guard：请重新登录一次")
+            }
+            rows.put(providerRow(
+                key = "doubao", label = "豆包", mode = "doubao",
+                ready = dbReady, issues = dbIssues,
+                rec = recs["doubao"], day = day, acctCount = if (dbReady) 1 else 0,
+                accts = if (dbReady) listOf(AcctRef(key = HistoryStore.DEFAULT_ACCOUNT, label = "主账号", sub = "doubao.com")) else emptyList(),
+            ))
+        }
 
         // 近 7 天：一条 SQL 取完，避免 7 次独立查询（/api/status 每 25 秒跑一次）
         val weekDays = (6 downTo 0).map { i ->
@@ -885,6 +1015,9 @@ class LocalApi(private val ctx: Context) {
         val msg = when {
             rec != null && rec.status == "fail" && !ready -> "未配置：请到设置填写后重试"
             rec != null -> rec.message
+            // 重置凭据后当天记录已删、凭据也没了：这里必须直说「未配置」，
+            // 否则卡片写着「今日尚未执行」，看起来像还能签（用户 m06802）。
+            !ready -> "未配置：请到设置填写后重试"
             else -> "今日尚未执行"
         }
         // 账号持有积分：优先当天签到结果；否则用上次缓存的读数（跨天仍可显示）
@@ -1234,6 +1367,45 @@ class LocalApi(private val ctx: Context) {
                 put("cookie", mask(s.hwCookie))
                 // portalCookie 保留字段但恒空：积分已改读签到同域接口，不需要门户会话。
                 put("portalCookie", "")
+                // V2.79：auth 域 Cookie 存在与否 = 静默重登能否用（前端据此显示
+                // 「到期自动续期：已就绪 / 缺 auth 域凭据」）。只回布尔，不回内容。
+                put("authCookieReady", s.hwAuthCookie.isNotBlank())
+                put("proxy", "")
+            })
+        })
+
+        // 豆包 V2.75 起搁置（DoubaoWebCheckin.ENABLED=false）：配置里不返回豆包，
+        // 前端 knownKeys 过滤后自然不画这张卡。
+        if (DoubaoWebCheckin.ENABLED) {
+            providers.put("doubao", JSONObject().apply {
+                put("enabled", true)
+                put("mode", "doubao")
+                put("doubao", JSONObject().apply {
+                    // 整串 Cookie 是凭据，一律掩码；saveConfig 见到 *** 会跳过，不会把掩码存回去
+                    put("cookie", mask(s.dbCookie))
+                    put("scene", s.dbScene)
+                    put("proxy", "")
+                })
+            })
+        }
+
+        // 智谱清言（V2.76 接入）：纯 OkHttp，签名能本地算，不需要 WebView。
+        providers.put("zhipu", JSONObject().apply {
+            put("enabled", true)
+            put("mode", "zhipu")
+            put("zhipu", JSONObject().apply {
+                put("cookie", mask(s.zpCookie))
+                put("deviceId", s.zpDeviceId)
+                put("proxy", "")
+            })
+        })
+
+        // 百度智能云 / 百度搭子 DuMate（V2.76 接入）：Cookie + csrftoken，纯 OkHttp。
+        providers.put("qianfan", JSONObject().apply {
+            put("enabled", true)
+            put("mode", "qianfan")
+            put("qianfan", JSONObject().apply {
+                put("cookie", mask(s.qfCookie))
                 put("proxy", "")
             })
         })
@@ -1330,6 +1502,38 @@ class LocalApi(private val ctx: Context) {
                     hwPortalCookie = pick("portalCookie", ns.hwPortalCookie),
                 )
             }
+
+            if (DoubaoWebCheckin.ENABLED) {
+                ps.optJSONObject("doubao")?.optJSONObject("doubao")?.let { db ->
+                    fun pick(k: String, cur: String): String {
+                        val v = db.optString(k, "")
+                        return if (v.isNotBlank() && !v.contains("***")) v else cur
+                    }
+                    ns = ns.copy(
+                        dbCookie = pick("cookie", ns.dbCookie),
+                        dbScene = pick("scene", ns.dbScene),
+                    )
+                }
+            }
+
+            ps.optJSONObject("zhipu")?.optJSONObject("zhipu")?.let { zp ->
+                fun pick(k: String, cur: String): String {
+                    val v = zp.optString(k, "")
+                    return if (v.isNotBlank() && !v.contains("***")) v else cur
+                }
+                ns = ns.copy(
+                    zpCookie = pick("cookie", ns.zpCookie),
+                    zpDeviceId = pick("deviceId", ns.zpDeviceId),
+                )
+            }
+
+            ps.optJSONObject("qianfan")?.optJSONObject("qianfan")?.let { qf ->
+                fun pick(k: String, cur: String): String {
+                    val v = qf.optString(k, "")
+                    return if (v.isNotBlank() && !v.contains("***")) v else cur
+                }
+                ns = ns.copy(qfCookie = pick("cookie", ns.qfCookie))
+            }
         }
 
         o.optJSONObject("scheduler")?.let { sc ->
@@ -1388,46 +1592,64 @@ class LocalApi(private val ctx: Context) {
                 if (had(s.wbToken)) cleared.add("wb.accessToken")
                 if (had(s.wbRefreshToken)) cleared.add("wb.refreshToken")
                 ns = ns.copy(wbToken = "", wbRefreshToken = "", wbUid = "", wbEnterpriseId = "", wbDomain = "")
-                // 多账号列表里的号也一起清：用户点「重置」的语义是「这台机器上不再登着它」，
-                // 只清主账号会让首页仍然显示别的号的积分，看起来像没重置成功。
-                runCatching { WbAccountStore.save(ctx, emptyList()) }
             }
             "traesolo" -> {
                 if (had(s.traeToken)) cleared.add("trae.token")
                 if (had(s.traeSession)) cleared.add("trae.session")
                 if (had(s.traeDeviceId)) cleared.add("trae.deviceId")
                 ns = ns.copy(traeToken = "", traeSession = "", traeDeviceId = "")
-                runCatching { TraeAccountStore.save(ctx, emptyList()) }
             }
             "qoder" -> {
                 if (had(s.qoderToken)) cleared.add("qoder.token")
                 if (had(s.qoderRefresh)) cleared.add("qoder.refreshToken")
                 ns = ns.copy(qoderToken = "", qoderRefresh = "", qoderUid = "", qoderMachineId = "")
-                runCatching { QoderAccountStore.save(ctx, emptyList()) }
             }
             "minimax" -> {
                 if (had(s.mmToken)) cleared.add("minimax.accessToken")
                 ns = ns.copy(mmToken = "", mmUserId = "", mmDeviceId = "")
-                runCatching { MmAccountStore.save(ctx, emptyList()) }
             }
             "huawei" -> {
                 if (had(s.hwCookie)) cleared.add("huawei.cookie")
-                ns = ns.copy(hwCookie = "", hwPortalCookie = "")
-                // 多账号列表也一起清（用户 m24258），否则「重置凭据」之后
-                // 首页仍然显示其他华为账号的卡片。
-                runCatching { HwAccountStore.save(ctx, emptyList()) }
-                runCatching { HwTodayMark.clearAll(ctx) }
-                runCatching { HwVerified.clearAll(ctx) }
+                if (had(s.hwAuthCookie)) cleared.add("huawei.authCookie")
+                // V2.79：auth 域 Cookie 也必须一起清 —— 它是「静默重登」的钥匙，
+                // 留着等于重置后还能拿旧凭据自动续期，用户以为已经退干净了。
+                // 「今天已签」与 probe 结论只清主账号那一桶（按旧 Cookie 算 key），
+                // 不能 clearAll —— 那会把多账号的结论一起抹掉。
+                runCatching { HwTodayMark.clear(ctx, s.hwCookie) }
+                runCatching { HwVerified.clear(ctx, s.hwCookie) }
+                ns = ns.copy(hwCookie = "", hwAuthCookie = "", hwPortalCookie = "")
+            }
+            "doubao" -> {
+                if (had(s.dbCookie)) cleared.add("doubao.cookie")
+                ns = ns.copy(dbCookie = "", dbScene = "")
+            }
+            "zhipu" -> {
+                if (had(s.zpCookie)) cleared.add("zhipu.cookie")
+                ns = ns.copy(zpCookie = "")
+            }
+            "qianfan" -> {
+                if (had(s.qfCookie)) cleared.add("qianfan.cookie")
+                ns = ns.copy(qfCookie = "")
             }
             else -> return """{"ok":false,"error":"unknown provider:$key"}"""
         }
         // 积分缓存也要清，否则首页卡片继续显示上一个账号的数字。
         runCatching { clearCachedTotal(key) }
+        // 当天的主账号记录也必须删（用户 m06802）：providerRow 在没有账号列表时会
+        // 拿当天历史记录反推卡片，只清凭据不删记录，那张卡会带着旧状态继续画在首页
+        // （「已签到 773」），用户点完「重置凭据」看到卡片还在，只能以为没生效。
+        //
+        // 只删主账号那一条 —— 多账号不受重置影响（用户 m06802 明确要求）。
+        // 主账号的 account_key 不一定是 "default"：WorkBuddy 用的是 uid（wbAccountKey）。
+        val mainAcctKey = if (key == "workbuddy") wbAccountKey(s) else HistoryStore.DEFAULT_ACCOUNT
+        val deleted = runCatching {
+            store.deleteAccount(today(), key, mainAcctKey)
+        }.getOrDefault(0)
         runBlocking { SettingsStore.save(ctx, ns) }
         val arr = JSONArray()
         cleared.forEach { arr.put(it) }
         return JSONObject().apply {
-            put("ok", true); put("key", key); put("cleared", arr)
+            put("ok", true); put("key", key); put("cleared", arr); put("deleted", deleted)
         }.toString()
     }
 
@@ -1446,10 +1668,12 @@ class LocalApi(private val ctx: Context) {
         })
         val trIssues = JSONArray()
         if (s.traeToken.isBlank() && s.traeSession.isBlank()) trIssues.put("缺少凭据：token 或 session")
-        if (s.traeDeviceId.isBlank()) trIssues.put("缺少 x-device-id")
+        // 设备号缺失不算问题（V2.86）：LocalCheckin.trae() 内部会用 DeviceId.derive() 派生并落盘。
+        // 以前这里既报 issue 又参与 ready，导致「界面显示未配置、定时任务根本不签」。
+        if (s.traeDeviceId.isBlank()) trIssues.put("设备号留空，签到时自动派生")
         arr.put(JSONObject().apply {
             put("key", "traesolo"); put("mode", "trae")
-            put("ready", (s.traeToken.isNotBlank() || s.traeSession.isNotBlank()) && s.traeDeviceId.isNotBlank())
+            put("ready", s.traeToken.isNotBlank() || s.traeSession.isNotBlank())
             put("issues", trIssues)
         })
         val qdIssues = JSONArray()
@@ -1543,6 +1767,9 @@ class LocalApi(private val ctx: Context) {
                 put("reachable", ok)
                 put("auth_ok", ok)
                 put("has_cftk", LocalCheckin.hwHasCftk(ck))
+                // V2.79：静默重登是否可用 —— auth 域凭据在就能在会话失效后自动换新，
+                // 不用用户重输手机号。空则只能手动重登。
+                put("auto_renew", s.hwAuthCookie.isNotBlank() || accs.any { it.authCookie.isNotBlank() })
                 put("accounts", accs.size)
                 // 积分接口与签到同域（/chat/snap-manager/v1/statistics/plugin），
                 // 用同一份 cookie —— 会话可用即积分可读。
@@ -1555,6 +1782,57 @@ class LocalApi(private val ctx: Context) {
                     else if (!ok) put("这份 Cookie 是未登录状态（华为对未登录访客也发匿名会话）：请重新登录一次")
                     else if (!LocalCheckin.hwHasCftk(ck))
                         put("Cookie 里没有 CSRF 令牌（cftk），领取会被拒 —— 请重新登录一次完整采集")
+                    // V2.79：没有 auth 域凭据时明确说清后果，否则用户只会看到「偶尔要重新登录」
+                    // 而不知道为什么。这不是错误，是能力缺失，所以排在最后一条。
+                    if (s.hwAuthCookie.isBlank() && accs.none { it.authCookie.isNotBlank() })
+                        put("没有 auth.huaweicloud.com 的 Cookie：会话过期后无法自动续期，需要重新登录一次")
+                })
+            }
+            "doubao" -> JSONObject().apply {
+                // 与华为同理：这里刻意不真打上游（探测按钮会被轮询触发，每次都打会加速耗会话）。
+                // 只做本地判据：Cookie 里有没有 sessionid 这一组。
+                // V2.75 起豆包搁置，ENABLED=false 时前端不会请求这个 key；这里仍保留实现，
+                // 将来改回 true 就能直接用，不需要重写。
+                val ck = s.dbCookie
+                val ok = ck.isNotBlank() && DoubaoWebCheckin.hasSession(ck)
+                put("reachable", ok)
+                put("auth_ok", ok)
+                put("cookie_len", ck.length)
+                put("scene", s.dbScene)
+                put("enabled", DoubaoWebCheckin.ENABLED)
+                put("issues", JSONArray().apply {
+                    if (!DoubaoWebCheckin.ENABLED) put("豆包已搁置（V2.75 起隐藏），不会参与签到")
+                    else if (ck.isBlank()) put("缺少豆包 Cookie：点「登录豆包」在站内登录一次即可自动采集")
+                    else if (!ok) put("Cookie 里没找到 sessionid / sid_tt / uid_tt / sid_guard：请重新登录一次完整采集")
+                    if (s.dbScene.isBlank()) put("还没探测过活动 scene（首次签到时自动试）")
+                })
+            }
+            "zhipu" -> JSONObject().apply {
+                // 纯本地判据（不发网络请求，与其它 provider 的 probe 口径一致）。
+                // 判据是 ZhipuCheckin.hasSession：refresh token 存在 **且** JWT 里不是游客。
+                // 只看「有没有 chatglm_token」会把游客认成已登录（见 ZhipuCheckin 类注释）。
+                val ck = s.zpCookie
+                val ok = ZhipuCheckin.hasSession(ck)
+                put("reachable", ok)
+                put("auth_ok", ok)
+                put("cookie_len", ck.length)
+                put("device_id", ZhipuCheckin.deviceIdOf(ck, s.zpDeviceId))
+                put("uid", ZhipuCheckin.uidOf(ck))
+                put("issues", JSONArray().apply {
+                    if (ck.isBlank()) put("缺少 Cookie：点「登录智谱清言」在站内登录一次即可自动采集")
+                    else if (!ok) put("这份 Cookie 是游客态（JWT 里 is_guest=true）：游客也有一套完整 token，请重新登录一次")
+                })
+            }
+            "qianfan" -> JSONObject().apply {
+                val ck = s.qfCookie
+                val ok = DumateCheckin.hasSession(ck)
+                put("reachable", ok)
+                put("auth_ok", ok)
+                put("cookie_len", ck.length)
+                put("csrf_len", DumateCheckin.csrfOf(ck).length)
+                put("issues", JSONArray().apply {
+                    if (ck.isBlank()) put("缺少 Cookie：点「登录百度智能云」在站内登录一次即可自动采集")
+                    else if (!ok) put("Cookie 里没有 BDUSS / bce-user-info：这是游客态，请重新登录一次")
                 })
             }
             else -> JSONObject().put("ok", false).put("error", "未知服务")
@@ -1608,6 +1886,11 @@ class LocalApi(private val ctx: Context) {
         if (isReady("qoder", s)) { active++; if (!allOkOf("qoder", qdExpect)) return false }
         if (isReady("minimax", s)) { active++; if (!allOkOf("minimax", mmExpect)) return false }
         if (isReady("huawei", s)) { active++; if (!allOkOf("huawei", hwExpect)) return false }
+        // 豆包 V2.75 起搁置（DoubaoWebCheckin.ENABLED=false）：不参与「今天全签完」判定，
+        // 否则一张永远签不成功的卡会让「今天已完成」永远不成立。
+        if (DoubaoWebCheckin.ENABLED && isReady("doubao", s)) { active++; if (!allOkOf("doubao", 1)) return false }
+        if (isReady("zhipu", s)) { active++; if (!allOkOf("zhipu", 1)) return false }
+        if (isReady("qianfan", s)) { active++; if (!allOkOf("qianfan", 1)) return false }
         return active > 0
     }
 
@@ -1622,12 +1905,15 @@ class LocalApi(private val ctx: Context) {
         "workbuddy" -> s.wbToken.isNotBlank() ||
             (try { WbAccountStore.all(ctx) } catch (e: Exception) { emptyList() })
                 .any { it.accessToken.isNotBlank() }
-        "traesolo" -> traeList(s).any {
-            (it.token.isNotBlank() || it.session.isNotBlank()) && it.deviceId.isNotBlank()
-        }
+        "traesolo" -> traeList(s).any { it.token.isNotBlank() || it.session.isNotBlank() }
         "qoder" -> qoderList(s).any { it.token.isNotBlank() || it.refresh.isNotBlank() }
         "minimax" -> mmList(s).any { it.token.isNotBlank() }
         "huawei" -> hwList(s).any { hwUsable(it.cookie) }
+        // V2.75 起豆包搁置：ENABLED=false 时一律不算就绪，任何调用方都跳过它。
+        "doubao" -> DoubaoWebCheckin.ENABLED &&
+            s.dbCookie.isNotBlank() && DoubaoWebCheckin.hasSession(s.dbCookie)
+        "zhipu" -> s.zpCookie.isNotBlank() && ZhipuCheckin.hasSession(s.zpCookie)
+        "qianfan" -> s.qfCookie.isNotBlank() && DumateCheckin.hasSession(s.qfCookie)
         else -> false
     }
 
@@ -1660,11 +1946,29 @@ class LocalApi(private val ctx: Context) {
         // 四家叠加就是「点了没反应」。现在四家同时发，总耗时 ≈ 最慢那家。
         val jobs = mutableListOf<() -> Any?>()
 
+        // 当天已经签完的账号（用户 m06895）：6 点手动签过、8 点定时任务再跑时不该重打上游。
+        //
+        // **必须在这里查完**：下面每个账号的网络请求都跑在线程池里，而本项目硬规则是
+        // 「线程池里绝不碰 SQLite」（见 AGENTS.md §6 通用段）。所以先在调用线程上把
+        // 「provider|accountKey → 原记录」查成一张普通 Map，job 里只做 map 查表。
+        //
+        // 命中时返回的是**原记录**（积分/连续天数/文案全部照抄），落库后与库里一致，
+        // 不会把首页的「已签到 773」冲成「已签到」。
+        val doneToday = runCatching { store.doneMap(day) }.getOrDefault(emptyMap())
+        fun doneOf(provider: String, accountKey: String): CheckinResult? =
+            doneToday[provider + "|" + accountKey.ifBlank { HistoryStore.DEFAULT_ACCOUNT }]
+
         // 1) WorkBuddy 主账号
         if (s.wbToken.isNotBlank()) {
-            jobs.add {
-                CheckinGate.run("workbuddy", wbAccountKey(s)) {
-                    runBlocking { WbAuth.runCheckin(ctx, s) }
+            val wbKey0 = wbAccountKey(s)
+            val wbDone = doneOf("workbuddy", wbKey0)
+            if (wbDone != null) {
+                jobs.add { wbDone }
+            } else {
+                jobs.add {
+                    CheckinGate.run("workbuddy", wbKey0) {
+                        runBlocking { WbAuth.runCheckin(ctx, s) }
+                    }
                 }
             }
         } else {
@@ -1678,7 +1982,11 @@ class LocalApi(private val ctx: Context) {
         // 那个 JSON 列表会互相覆盖，丢账号。
         multiAccs.forEach { acc ->
             jobs.add {
-                try {
+                // 当天已签直接返回原记录（用户 m06895）
+                val done = doneOf("workbuddy", acc.id)
+                if (done != null) {
+                    Pair(null, done)
+                } else try {
                     // 闸门：同一账号并发时只打一次上游（定时任务 vs 手动点击）
                     var fresh: WbAccount? = null
                     val r = CheckinGate.run("workbuddy", acc.id) {
@@ -1726,7 +2034,11 @@ class LocalApi(private val ctx: Context) {
         val traeJobStart = if (traeAccs.isNotEmpty()) jobs.size else -1
         traeAccs.forEach { acc ->
             jobs.add {
-                CheckinGate.run("traesolo", acc.id) {
+                // 当天已签直接返回原记录（用户 m06895）
+                val done = doneOf("traesolo", acc.id)
+                if (done != null) {
+                    done
+                } else CheckinGate.run("traesolo", acc.id) {
                     runBlocking {
                         LocalCheckin.trae(
                             acc.token, acc.deviceId, acc.global, acc.session,
@@ -1744,14 +2056,20 @@ class LocalApi(private val ctx: Context) {
 
         // 4) Qoder CN —— token 或 refreshToken 有一个就签；设备指纹选填（实测不带头也 200）
         val qoderAccs = qoderList(s)
+        // BUGS-v2.63-287 P3-1：续期换出来的新 (token, refresh_token) 先收在这里，
+        // job 里不能直接写 DataStore（硬规则「线程池绝不碰 SQLite / SharedPreferences」），
+        // 落库段在调用线程统一回写。与 hwRenewed / zpRenewed 同一套做法。
+        val qdRenewed = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String>>()
         qoderAccs.forEach { acc ->
             jobs.add {
-                CheckinGate.run("qoder", acc.id) {
+                // 当天已签直接返回原记录（用户 m06895）
+                doneOf("qoder", acc.id) ?: CheckinGate.run("qoder", acc.id) {
                     runBlocking {
                         LocalCheckin.qoder(
                             acc.region.ifBlank { "cn" }, acc.token,
                             acc.uid, acc.machineId, "",
-                            acc.refresh
+                            acc.refresh,
+                            onRenewed = { t, rf -> qdRenewed[acc.id] = Pair(t, rf) }
                         )
                     }
                 }
@@ -1762,22 +2080,92 @@ class LocalApi(private val ctx: Context) {
         val mmAccs = mmList(s)
         mmAccs.forEach { acc ->
             jobs.add {
-                CheckinGate.run("minimax", acc.id) {
-                    runBlocking { LocalCheckin.minimax(acc.token, acc.userId, acc.deviceId, "") }
-                }
+                // 当天已签直接返回原记录（用户 m06895）
+                doneOf("minimax", acc.id)
+                    ?: CheckinGate.run("minimax", acc.id) {
+                        runBlocking { LocalCheckin.minimax(acc.token, acc.userId, acc.deviceId, "") }
+                    }
             }
         }
 
         // 6) 华为码道 —— 多账号（用户 m24258），每账号一份 Cookie，一个 job 一个。
         // 过滤用 hwUsable 而非 hwHasSession（BUGS-v2.46 P2）：被证实是匿名会话的 Cookie
         // 不该被派 job —— 派了必然 401，失败结果还会把当天那条 success 记录覆盖掉。
+        //
+        // V2.79：静默重登。auth 域的长期凭据传给 HwCheckin.run，登录态失效时它会用
+        // 不可见 WebView 走一次 302 拿到新 SESSION_ID，并通过 onRenewed 回传。
+        // 新 Cookie 必须**立刻落盘**（与 Trae 换 token 同一理由）：不写回的话下一轮
+        // 还是拿旧 Cookie 去打、还要再花 18 秒重登一次。
         val hwAccs = hwList(s).filter { hwUsable(it.cookie) }
         val hwJobStart = if (hwAccs.isNotEmpty()) jobs.size else -1
+        val hwRenewed = java.util.concurrent.ConcurrentHashMap<String, HwRenew.Renewed>()
         hwAccs.forEach { acc ->
             jobs.add {
-                CheckinGate.run("huawei", acc.id) {
-                    runBlocking { HwCheckin.run(ctx, acc.cookie, s.hwPortalCookie) }
+                // 当天已签直接返回原记录（用户 m06895）。华为本来有 HwTodayMark 当日标记，
+                // 但那层会在换 Cookie / 清标记后失效，用历史记录兜一道更稳。
+                doneOf("huawei", acc.id) ?: CheckinGate.run("huawei", acc.id) {
+                    runBlocking {
+                        // 主账号用设置里那份 authCookie，列表账号用自己那份（V2.79：
+                        // 每个华为号在 auth 域的凭据不同，共用会把 A 号的拿去给 B 号续期）。
+                        val auth = if (acc.id == HistoryStore.DEFAULT_ACCOUNT) s.hwAuthCookie else acc.authCookie
+                        HwCheckin.run(ctx, acc.cookie, s.hwPortalCookie, auth) { fresh ->
+                            hwRenewed[acc.id] = fresh
+                        }
+                    }
                 }
+            }
+        }
+
+        // 6b) 豆包（V2.66 重新接入；**V2.75 起搁置**，ENABLED=false 时整块不派 job）。
+        // 只在 isReady 为真时派 job：没有 sessionid 的 Cookie 打上游必然 710012001，
+        // 派了只会白等一轮超时，还会把当天已有的 success 记录覆盖成 fail。
+        // 搁置原因见 DoubaoWebCheckin.ENABLED 的注释。
+        val dbReady = DoubaoWebCheckin.ENABLED && isReady("doubao", s)
+        // BUGS-v2.63 P3-8：原来叫 dbJobStart（和 traeJobStart 一样暗示「job 起始下标」），
+        // 但它从不参与下标运算 —— 消费段是靠 idx++ 顺序读，这里只当「有没有派过」的开关用。
+        // 改成 Boolean 名字，避免后来人以为它像 Trae 那样有独立超时策略。
+        val dbDispatched = dbReady
+        if (dbReady) {
+            jobs.add {
+                // 当天已签直接返回原记录（用户 m06895）
+                doneOf("doubao", HistoryStore.DEFAULT_ACCOUNT)
+                    ?: CheckinGate.run("doubao", HistoryStore.DEFAULT_ACCOUNT) {
+                        runBlocking { DoubaoWebCheckin.run(ctx, s.dbCookie) }
+                    }
+            }
+        }
+
+        // 6c) 智谱清言（V2.76 接入）：纯 HTTP，一次写请求。
+        // 只在 isReady 为真时派 job —— 游客态 Cookie 打上游只会拿到 401 40103，
+        // 派了白等一轮，还会把当天已有的 success 记录覆盖成 fail。
+        val zpReady2 = isReady("zhipu", s)
+        val zpDispatched = zpReady2
+        // BUGS-v2.63-286 P3：智谱 refresh 若真的轮换出新 refresh_token，job 里不能直接
+        // 写 DataStore（硬规则：线程池绝不碰 SQLite / SharedPreferences），先收在这里，
+        // 落库段在调用线程统一回写。与 hwRenewed 同一套做法。
+        val zpRenewed = java.util.concurrent.ConcurrentHashMap<String, String>()
+        if (zpReady2) {
+            jobs.add {
+                // 当天已签直接返回原记录（用户 m06895）
+                doneOf("zhipu", HistoryStore.DEFAULT_ACCOUNT)
+                    ?: CheckinGate.run("zhipu", HistoryStore.DEFAULT_ACCOUNT) {
+                        runBlocking {
+                            ZhipuCheckin.run(s.zpCookie, s.zpDeviceId) { rt -> zpRenewed["zhipu"] = rt }
+                        }
+                    }
+            }
+        }
+
+        // 6d) 百度智能云 / 百度搭子（V2.76 接入）：Cookie + csrftoken 纯 HTTP。
+        val qfReady2 = isReady("qianfan", s)
+        val qfDispatched = qfReady2
+        if (qfReady2) {
+            jobs.add {
+                // 当天已签直接返回原记录（用户 m06895）
+                doneOf("qianfan", HistoryStore.DEFAULT_ACCOUNT)
+                    ?: CheckinGate.run("qianfan", HistoryStore.DEFAULT_ACCOUNT) {
+                        runBlocking { DumateCheckin.run(s.qfCookie) }
+                    }
             }
         }
 
@@ -1846,9 +2234,22 @@ class LocalApi(private val ctx: Context) {
         }
         results.put("workbuddy", toJson(wbAgg, day))
 
-        traeRenewed[0]?.let { fresh ->
-            // 换到新 token 立刻落盘，否则下次定时任务还在用旧的 8 小时 JWT
-            runCatching { runBlocking { SettingsStore.save(ctx, s.copy(traeToken = fresh)) } }
+        // BUGS-v2.63-288 P1：主账号的 token 与 deviceId 必须合成一次写。
+        // 以前是两段各自 `SettingsStore.save(ctx, s.copy(...))`，都基于本轮
+        // 开头读到的旧快照 `s` —— 后执行的那次把前一次刚写的字段覆盖回旧值。
+        // `LocalCheckin.trae()` 里设备号回调（:835）排在 token 回调（:851）
+        // 之前，所以这里原来是「先存 deviceId、再存 token」→ deviceId 被冲掉；
+        // 一旦顺序反过来就换成 token 被冲掉。两种都表现为「本轮成功、下次
+        // 还是旧凭据」。这里改成先重新读当前配置再一次性合并写。
+        if (traeRenewed[0] != null || traeRenewedDev[HistoryStore.DEFAULT_ACCOUNT] != null) {
+            runCatching {
+                runBlocking {
+                    val cur = SettingsStore.flow(ctx).first()
+                    SettingsStore.save(ctx, cur.copy(
+                        traeToken = traeRenewed[0] ?: cur.traeToken,
+                        traeDeviceId = traeRenewedDev[HistoryStore.DEFAULT_ACCOUNT] ?: cur.traeDeviceId))
+                }
+            }
         }
         // 多账号换到的 token 逐个写回列表（主线程串行，避免 JSON 列表互相覆盖）
         if (traeRenewedAcc.isNotEmpty()) {
@@ -1859,16 +2260,19 @@ class LocalApi(private val ctx: Context) {
                 }
             }
         }
-        // 9074 换到的设备号同样要落盘：主账号写 DataStore，其余写列表。
+        // 9074 换到的设备号同样要落盘：列表账号写列表。
         // 不写回的话下一轮还是旧号，等于每次都要多打一次上游才失败。
+        //
+        // BUGS-v2.63-288 P1：列表账号也不能分两次 update —— `TraeAccountStore.update`
+        // 是整条替换，后一次会拿同一份旧 `acc` 覆盖前一次刚写的字段。
+        // 所以 token 与 deviceId 在这里合并成一次 update。
         if (traeRenewedDev.isNotEmpty()) {
-            traeRenewedDev[HistoryStore.DEFAULT_ACCOUNT]?.let { fresh ->
-                runCatching { runBlocking { SettingsStore.save(ctx, s.copy(traeDeviceId = fresh)) } }
-            }
             runCatching {
                 traeAccs.filter { it.id != HistoryStore.DEFAULT_ACCOUNT }.forEach { acc ->
-                    val fresh = traeRenewedDev[acc.id] ?: return@forEach
-                    TraeAccountStore.update(ctx, acc.copy(deviceId = fresh))
+                    val freshDev = traeRenewedDev[acc.id] ?: return@forEach
+                    TraeAccountStore.update(ctx, acc.copy(
+                        token = traeRenewedAcc[acc.id] ?: acc.token,
+                        deviceId = freshDev))
                 }
             }
         }
@@ -1912,6 +2316,21 @@ class LocalApi(private val ctx: Context) {
             val r = out.getOrNull(i) as? CheckinResult ?: CheckinResult(
                 "qoder", "fail", fallback(i, "缺少凭据：填 dt- token 或 drt- refreshToken"))
             store.upsert(day, r, acctKey(acc.id))
+            // BUGS-v2.63-287 P3-1：续期换出的新凭据在调用线程回写。
+            qdRenewed[acc.id]?.let { (t, rf) ->
+                if (acc.id == HistoryStore.DEFAULT_ACCOUNT) {
+                    runCatching {
+                        runBlocking {
+                            val cur = SettingsStore.flow(ctx).first()
+                            SettingsStore.save(ctx, cur.copy(
+                                qoderToken = t.ifBlank { cur.qoderToken },
+                                qoderRefresh = rf.ifBlank { cur.qoderRefresh }))
+                        }
+                    }
+                } else {
+                    runCatching { QoderAccountStore.update(ctx, acc.copy(token = t, refresh = rf)) }
+                }
+            }
             if (acc.id != HistoryStore.DEFAULT_ACCOUNT) {
                 runCatching {
                     QoderAccountStore.update(ctx, acc.copy(
@@ -1951,6 +2370,31 @@ class LocalApi(private val ctx: Context) {
 
         // ── 华为码道：逐账号落库 + 汇总一行（用户 m24258）──
         if (hwJobStart >= 0) {
+            // V2.79：静默重登换到的新 Cookie 先落盘（主账号写 Settings，列表账号写 store）。
+            // 放在落库之前：即使这一轮结果仍是 fail，新凭据也是有效资产。
+            if (hwRenewed.isNotEmpty()) {
+                hwRenewed[HistoryStore.DEFAULT_ACCOUNT]?.let { fresh ->
+                    runCatching {
+                        runBlocking {
+                            val cur = SettingsStore.flow(ctx).first()
+                            SettingsStore.save(ctx, cur.copy(
+                                hwCookie = fresh.cookie,
+                                hwAuthCookie = fresh.authCookie,
+                                hwPortalCookie = fresh.portalCookie.ifBlank { cur.hwPortalCookie },
+                            ))
+                        }
+                    }
+                }
+                hwAccs.filter { it.id != HistoryStore.DEFAULT_ACCOUNT }.forEach { acc ->
+                    val fresh = hwRenewed[acc.id] ?: return@forEach
+                    runCatching {
+                        HwAccountStore.update(ctx, acc.copy(
+                            cookie = fresh.cookie,
+                            authCookie = fresh.authCookie.ifBlank { acc.authCookie },
+                        ))
+                    }
+                }
+            }
             val hwListRes = mutableListOf<CheckinResult>()
             hwAccs.forEach { acc ->
                 val i = idx++
@@ -1972,12 +2416,49 @@ class LocalApi(private val ctx: Context) {
                 aggregate("huawei", hwListRes, "缺少华为会话 Cookie：点「登录华为码道」在站内登录一次"), day))
         }
 
+        // ── 豆包：单账号落库（V2.66）──
+        if (dbDispatched) {
+            val i = idx++
+            val r = out.getOrNull(i) as? CheckinResult ?: CheckinResult(
+                "doubao", "fail", fallback(i, "缺少豆包 Cookie：点「登录豆包」在站内登录一次"))
+            store.upsert(day, r, HistoryStore.DEFAULT_ACCOUNT)
+            results.put("doubao", toJson(r, day))
+        }
+
+        // ── 智谱清言 / 百度千帆：单账号落库（V2.76）──
+        if (zpDispatched) {
+            val i = idx++
+            val r = out.getOrNull(i) as? CheckinResult ?: CheckinResult(
+                "zhipu", "fail", fallback(i, "缺少 Cookie：点「登录智谱清言」在站内登录一次"))
+            store.upsert(day, r, HistoryStore.DEFAULT_ACCOUNT)
+            // BUGS-v2.63-286 P3：refresh 轮换出来的新 refresh_token 在这里回写
+            zpRenewed["zhipu"]?.let { rt ->
+                runCatching {
+                    runBlocking {
+                        val cur = SettingsStore.flow(ctx).first()
+                        SettingsStore.save(ctx, cur.copy(zpCookie = ZhipuCheckin.withRefreshToken(cur.zpCookie, rt)))
+                    }
+                }
+            }
+            results.put("zhipu", toJson(r, day))
+        }
+        if (qfDispatched) {
+            val i = idx++
+            val r = out.getOrNull(i) as? CheckinResult ?: CheckinResult(
+                "qianfan", "fail", fallback(i, "缺少 Cookie：点「登录百度智能云」在站内登录一次"))
+            store.upsert(day, r, HistoryStore.DEFAULT_ACCOUNT)
+            results.put("qianfan", toJson(r, day))
+        }
+
         // P3-5：原来 `extraN = results.length() - 2` 是「总家数减 2」，而
         // `results` 里 workbuddy 与 traesolo 都是无条件写入的，于是：
         //   · Trae 完全没配（只有 workbuddy）时 extraN 仍是 0，但文案会说「共 2 家」；
         //   · Qoder 没配（不写 key）时反而少算一家。
         // 改成按「真正产生了结果的家数」数，并把账号数单独说出来。
-        val famKeys = listOf("workbuddy", "traesolo", "qoder", "minimax", "huawei").filter { results.has(it) }
+        val famKeys = listOf(
+            "workbuddy", "traesolo", "qoder", "minimax", "huawei",
+            "doubao", "zhipu", "qianfan",
+        ).filter { results.has(it) }
         val summary = when {
             wbList.size > 1 -> "本地签到完成（WorkBuddy ${wbList.size} 个账号 + 其他 ${famKeys.size - 1} 家）"
             famKeys.size > 1 -> "本地签到完成（共 ${famKeys.size} 家）"
@@ -2032,6 +2513,17 @@ class LocalApi(private val ctx: Context) {
     private fun checkinOne(key: String, log: Boolean = true): String {
         val s = settings()
         val day = today()
+        // V2.86（BUGS-v2.63 P2-2）：单卡签到也要「当天已签就跳过」，与 checkinAll 同口径。
+        //
+        // 以前只有 checkinAll 做了短路，checkinOne 完全没有 —— 用户当天签成功后点一下单卡的
+        // 「签到」，WorkBuddy / Trae / Qoder / MiniMax 会实打实再打一轮上游。Trae 的 9074
+        // （ErrWorkRiskControlBanned）已证明重复/密集请求会累积风险，这不是纯理论问题。
+        //
+        // 只对真实签到（log=true）生效：log=false 是「测试签到」按钮，用户就是要真打一次看
+        // 上游返回什么，复用旧记录会骗人（checkinAll 里那句 reuse=log 是同一套理由）。
+        val doneToday = if (log) runCatching { store.doneMap(day) }.getOrDefault(emptyMap()) else emptyMap()
+        fun doneOf(provider: String, accountKey: String): CheckinResult? =
+            doneToday[provider + "|" + accountKey.ifBlank { HistoryStore.DEFAULT_ACCOUNT }]
 
         // WorkBuddy 多账号：每个账号各写一行（用 account_key 区分），
         // 不能汇总成一行——那会互相覆盖，只剩最后一个账号的记录。
@@ -2041,6 +2533,8 @@ class LocalApi(private val ctx: Context) {
             // 当前分支前提 s.wbToken 为空，isSameAsMainAccount 必然 false，所以不会真重复；
             // 但将来若允许「主账号 token 与列表账号并存」，少了这层过滤就会打两次接口。
             val list = accs.filter { it.accessToken.isNotBlank() && !isSameAsMainAccount(it, s) }.map { acc ->
+                val done = doneOf("workbuddy", acc.id)
+                if (done != null) return@map done
                 val one = try {
                     // 闸门：log=false 是「测试签到」，必须 reuse=false —— 复用旧结果会骗人，
                     // 也不能把没落库的结果写进复用表（否则紧接着的真实签到会被去重成漏签）
@@ -2091,6 +2585,7 @@ class LocalApi(private val ctx: Context) {
             val ones = mutableListOf<CheckinResult>()
             when (key) {
                 "traesolo" -> traeList(s).forEach { acc ->
+                    doneOf("traesolo", acc.id)?.let { ones.add(it); return@forEach }
                     // 用户 m18704：这里原来每个账号之间 sleep 12~25 秒（为躲 9074）。
                     // 9074 只由 claim 触发、status 查询不会，节流已经收进
                     // `LocalCheckin.throttleTraeClaim()`（只管 claim 那一下，间隔 3 秒），
@@ -2114,15 +2609,28 @@ class LocalApi(private val ctx: Context) {
                         CheckinResult("traesolo", "fail",
                             "签到异常：${e.message ?: e.javaClass.simpleName}", "")
                     }
-                    renewedDev?.let { fresh ->
-                        if (acc.id == HistoryStore.DEFAULT_ACCOUNT)
-                            runCatching { runBlocking { SettingsStore.save(ctx, s.copy(traeDeviceId = fresh)) } }
-                        else runCatching { TraeAccountStore.update(ctx, acc.copy(deviceId = fresh)) }
-                    }
-                    renewed?.let { fresh ->
-                        if (acc.id == HistoryStore.DEFAULT_ACCOUNT)
-                            runCatching { runBlocking { SettingsStore.save(ctx, s.copy(traeToken = fresh)) } }
-                        else runCatching { TraeAccountStore.update(ctx, acc.copy(token = fresh)) }
+                    // BUGS-v2.63-288 P1：token 与 deviceId 合成一次写。
+                    // 以前是两段各自 `SettingsStore.save(ctx, s.copy(...))` /
+                    // 两次 `TraeAccountStore.update(acc.copy(...))`，都基于本轮
+                    // 开头读到的旧快照 —— 后执行的那次把前一次刚写的字段覆盖回旧值。
+                    // `TraeAccountStore.update` 是整条替换，同样会互相覆盖。
+                    if (renewed != null || renewedDev != null) {
+                        if (acc.id == HistoryStore.DEFAULT_ACCOUNT) {
+                            runCatching {
+                                runBlocking {
+                                    val cur = SettingsStore.flow(ctx).first()
+                                    SettingsStore.save(ctx, cur.copy(
+                                        traeToken = renewed ?: cur.traeToken,
+                                        traeDeviceId = renewedDev ?: cur.traeDeviceId))
+                                }
+                            }
+                        } else {
+                            runCatching {
+                                TraeAccountStore.update(ctx, acc.copy(
+                                    token = renewed ?: acc.token,
+                                    deviceId = renewedDev ?: acc.deviceId))
+                            }
+                        }
                     }
                     if (log) store.upsert(day, r0, acctKey(acc.id))
                     if (acc.id != HistoryStore.DEFAULT_ACCOUNT) {
@@ -2137,16 +2645,37 @@ class LocalApi(private val ctx: Context) {
                     ones.add(r0)
                 }
                 "qoder" -> qoderList(s).forEach { acc ->
+                    doneOf("qoder", acc.id)?.let { ones.add(it); return@forEach }
+                    // BUGS-v2.63-287 P3-1：续期换出的新凭据回写
+                    var qdTok: String? = null
+                    var qdRef: String? = null
                     val r0 = try {
                         CheckinGate.run("qoder", acc.id, reuse = log) {
                             runBlocking {
                                 LocalCheckin.qoder(acc.region.ifBlank { "cn" }, acc.token,
-                                    acc.uid, acc.machineId, "", acc.refresh)
+                                    acc.uid, acc.machineId, "", acc.refresh,
+                                    onRenewed = { t, rf -> qdTok = t; qdRef = rf })
                             }
                         }
                     } catch (e: Exception) {
                         CheckinResult("qoder", "fail",
                             "签到异常：${e.message ?: e.javaClass.simpleName}", "")
+                    }
+                    if (qdTok != null || qdRef != null) {
+                        runCatching {
+                            runBlocking {
+                                if (acc.id == HistoryStore.DEFAULT_ACCOUNT) {
+                                    val cur = SettingsStore.flow(ctx).first()
+                                    SettingsStore.save(ctx, cur.copy(
+                                        qoderToken = qdTok ?: cur.qoderToken,
+                                        qoderRefresh = qdRef ?: cur.qoderRefresh))
+                                } else {
+                                    QoderAccountStore.update(ctx, acc.copy(
+                                        token = qdTok ?: acc.token,
+                                        refresh = qdRef ?: acc.refresh))
+                                }
+                            }
+                        }
                     }
                     if (log) store.upsert(day, r0, acctKey(acc.id))
                     if (acc.id != HistoryStore.DEFAULT_ACCOUNT) {
@@ -2161,6 +2690,7 @@ class LocalApi(private val ctx: Context) {
                     ones.add(r0)
                 }
                 else -> mmList(s).forEach { acc ->
+                    doneOf("minimax", acc.id)?.let { ones.add(it); return@forEach }
                     val r0 = try {
                         CheckinGate.run("minimax", acc.id, reuse = log) {
                             runBlocking {
@@ -2203,13 +2733,41 @@ class LocalApi(private val ctx: Context) {
             }
             val ones = mutableListOf<CheckinResult>()
             accs.forEach { a ->
+                doneOf("huawei", a.id)?.let { ones.add(it); return@forEach }
+                // V2.79：静默重登换到的新 Cookie 就地落盘（单家签到这条路径不经过
+                // checkinAll 的落盘段，漏了就等于每次都要重登一次）。
+                var renewed: HwRenew.Renewed? = null
                 val r0 = try {
                     CheckinGate.run("huawei", a.id, reuse = log) {
-                        runBlocking { HwCheckin.run(ctx, a.cookie, s.hwPortalCookie) }
+                        runBlocking {
+                            val auth = if (a.id == HistoryStore.DEFAULT_ACCOUNT) s.hwAuthCookie else a.authCookie
+                            HwCheckin.run(ctx, a.cookie, s.hwPortalCookie, auth) { fresh ->
+                                renewed = fresh
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     CheckinResult("huawei", "fail",
                         "签到异常：${e.message ?: e.javaClass.simpleName}", "")
+                }
+                renewed?.let { fresh ->
+                    runCatching {
+                        if (a.id == HistoryStore.DEFAULT_ACCOUNT) {
+                            runBlocking {
+                                val cur = SettingsStore.flow(ctx).first()
+                                SettingsStore.save(ctx, cur.copy(
+                                    hwCookie = fresh.cookie,
+                                    hwAuthCookie = fresh.authCookie,
+                                    hwPortalCookie = fresh.portalCookie.ifBlank { cur.hwPortalCookie },
+                                ))
+                            }
+                        } else {
+                            HwAccountStore.update(ctx, a.copy(
+                                cookie = fresh.cookie,
+                                authCookie = fresh.authCookie.ifBlank { a.authCookie },
+                            ))
+                        }
+                    }
                 }
                 if (log) store.upsert(day, r0, acctKey(a.id))
                 if (a.id != HistoryStore.DEFAULT_ACCOUNT) {
@@ -2227,7 +2785,82 @@ class LocalApi(private val ctx: Context) {
                 aggregate("huawei", ones, "缺少华为会话 Cookie：点「登录华为码道」在站内登录一次"), day).toString()
         }
 
-        val r = CheckinGate.run(key, if (key == "workbuddy") wbAccountKey(s) else HistoryStore.DEFAULT_ACCOUNT, reuse = log) {
+        // 豆包（V2.66）：单账号，走 WebView 页面内 fetch。
+        // V2.75 起搁置（DoubaoWebCheckin.ENABLED=false）：直接返回「已搁置」，
+        // 不发任何请求，也不落库（否则历史里会多一条永远 fail 的记录）。
+        if (key == "doubao") {
+            if (!DoubaoWebCheckin.ENABLED) {
+                return toJson(CheckinResult(
+                    "doubao", "fail", "豆包已搁置（V2.75 起隐藏），不会参与签到", ""), day).toString()
+            }
+            if (!isReady("doubao", s)) {
+                return toJson(CheckinResult(
+                    "doubao", "fail",
+                    "缺少豆包 Cookie：点「登录豆包」在站内登录一次", ""), day).toString()
+            }
+            val r0 = doneOf("doubao", HistoryStore.DEFAULT_ACCOUNT) ?: try {
+                CheckinGate.run("doubao", HistoryStore.DEFAULT_ACCOUNT, reuse = log) {
+                    runBlocking { DoubaoWebCheckin.run(ctx, s.dbCookie) }
+                }
+            } catch (e: Exception) {
+                CheckinResult("doubao", "fail",
+                    "签到异常：${e.message ?: e.javaClass.simpleName}", "")
+            }
+            if (log) store.upsert(day, r0, HistoryStore.DEFAULT_ACCOUNT)
+            return toJson(r0, day).toString()
+        }
+
+        // 智谱清言（V2.76）：单账号纯 HTTP。
+        if (key == "zhipu") {
+            if (!isReady("zhipu", s)) {
+                return toJson(CheckinResult(
+                    "zhipu", "fail",
+                    "缺少 Cookie：点「登录智谱清言」在站内登录一次", ""), day).toString()
+            }
+            val r0 = doneOf("zhipu", HistoryStore.DEFAULT_ACCOUNT) ?: try {
+                // BUGS-v2.63-286 P3：refresh 轮换时回写 zpCookie（平时不触发）。
+                var zpNewRt: String? = null
+                val rr = CheckinGate.run("zhipu", HistoryStore.DEFAULT_ACCOUNT, reuse = log) {
+                    runBlocking { ZhipuCheckin.run(s.zpCookie, s.zpDeviceId) { rt -> zpNewRt = rt } }
+                }
+                zpNewRt?.let { rt ->
+                    runCatching {
+                        runBlocking {
+                            val cur = SettingsStore.flow(ctx).first()
+                            SettingsStore.save(ctx, cur.copy(zpCookie = ZhipuCheckin.withRefreshToken(cur.zpCookie, rt)))
+                        }
+                    }
+                }
+                rr
+            } catch (e: Exception) {
+                CheckinResult("zhipu", "fail",
+                    "签到异常：${e.message ?: e.javaClass.simpleName}", "")
+            }
+            if (log) store.upsert(day, r0, HistoryStore.DEFAULT_ACCOUNT)
+            return toJson(r0, day).toString()
+        }
+
+        // 百度千帆 / 百度搭子（V2.76）：单账号纯 HTTP（Cookie + csrftoken）。
+        if (key == "qianfan") {
+            if (!isReady("qianfan", s)) {
+                return toJson(CheckinResult(
+                    "qianfan", "fail",
+                    "缺少 Cookie：点「登录百度智能云」在站内登录一次", ""), day).toString()
+            }
+            val r0 = doneOf("qianfan", HistoryStore.DEFAULT_ACCOUNT) ?: try {
+                CheckinGate.run("qianfan", HistoryStore.DEFAULT_ACCOUNT, reuse = log) {
+                    runBlocking { DumateCheckin.run(s.qfCookie) }
+                }
+            } catch (e: Exception) {
+                CheckinResult("qianfan", "fail",
+                    "签到异常：${e.message ?: e.javaClass.simpleName}", "")
+            }
+            if (log) store.upsert(day, r0, HistoryStore.DEFAULT_ACCOUNT)
+            return toJson(r0, day).toString()
+        }
+
+        val mainKey = if (key == "workbuddy") wbAccountKey(s) else HistoryStore.DEFAULT_ACCOUNT
+        val r = doneOf(key, mainKey) ?: CheckinGate.run(key, mainKey, reuse = log) {
             runBlocking {
                 when (key) {
                     "workbuddy" -> WbAuth.runCheckin(ctx, s)
@@ -2236,7 +2869,7 @@ class LocalApi(private val ctx: Context) {
             }
         }
         if (log) {
-            store.upsert(day, r, if (key == "workbuddy") wbAccountKey(s) else HistoryStore.DEFAULT_ACCOUNT)
+            store.upsert(day, r, mainKey)
         }
         return toJson(r, day).toString()
     }
@@ -2446,7 +3079,7 @@ class LocalApi(private val ctx: Context) {
         o.put("wb_ready", s.wbToken.isNotBlank() || runCatching {
             WbAccountStore.all(ctx).any { it.accessToken.isNotBlank() }
         }.getOrDefault(false))
-        o.put("trae_ready", (s.traeToken.isNotBlank() || s.traeSession.isNotBlank()) && s.traeDeviceId.isNotBlank())
+        o.put("trae_ready", s.traeToken.isNotBlank() || s.traeSession.isNotBlank())
         o.put("trae_has_session", s.traeSession.isNotBlank())
         o.put("trae_has_token", s.traeToken.isNotBlank())
         o.put("trae_device_id", s.traeDeviceId)
@@ -2503,6 +3136,29 @@ class LocalApi(private val ctx: Context) {
                 .put("detail", if (!hwOk) "未登录（会跳过）"
                     else if (hwAccsDiag.size > 1) "${hwAccsDiag.size} 个账号 · 会话就绪 · 余额可读"
                     else "会话就绪 · 余额可读"))
+
+            // 豆包（V2.66）：单账号，判据与 isReady 一致。
+            // V2.75 起搁置（DoubaoWebCheckin.ENABLED=false）：整条不列，界面上不出现。
+            if (DoubaoWebCheckin.ENABLED) {
+                val dbOk = isReady("doubao", s)
+                provs.put(JSONObject().put("key", "doubao").put("label", "豆包")
+                    .put("ready", dbOk)
+                    .put("detail", if (!dbOk) "未登录（会跳过）"
+                        else "Cookie 就绪 · 免签名直调"))
+            }
+
+            // 智谱清言 / 百度千帆（V2.76）：单账号，判据与 isReady 一致。
+            val zpOk = isReady("zhipu", s)
+            provs.put(JSONObject().put("key", "zhipu").put("label", "智谱清言")
+                .put("ready", zpOk)
+                .put("detail", if (!zpOk) "未登录（会跳过）"
+                    else "Cookie 就绪 · 签到前自动续期 access token"))
+
+            val qfOk = isReady("qianfan", s)
+            provs.put(JSONObject().put("key", "qianfan").put("label", "百度千帆")
+                .put("ready", qfOk)
+                .put("detail", if (!qfOk) "未登录（会跳过）"
+                    else "Cookie 就绪 · csrftoken 已取"))
         }
         o.put("providers", provs)
         return o.toString()
@@ -2554,6 +3210,9 @@ class LocalApi(private val ctx: Context) {
         // 每步 300~500ms，加起来 1.2~1.5 秒；三路互不依赖，并行后 ≈ 最慢那步。
         val traeRenewed = arrayOfNulls<String>(1)
         val traeRenewedAcc = java.util.concurrent.ConcurrentHashMap<String, String>()
+        // BUGS-v2.63-287 P3-2：Qoder 余额路径也在续期，同样会把新 refresh_token 丢掉。
+        // 与签到路径同一套做法：先收进 Map，回主线程串行落库。
+        val qdRenewed = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String>>()
         val tasks = mutableListOf<() -> Any?>()
 
         // WorkBuddy：每个账号一个任务（读自己的余额），外加一个「当前选中账号」的签到状态。
@@ -2595,7 +3254,8 @@ class LocalApi(private val ctx: Context) {
                     runBlocking {
                         LocalCheckin.qoderHeldAndUsed(
                             acc.region.ifBlank { "cn" }, acc.token, acc.uid, acc.machineId, "",
-                            acc.refresh)
+                            acc.refresh,
+                            onRenewed = { t, rf -> qdRenewed[acc.id] = Pair(t, rf) })
                     }
                 }.getOrDefault(Pair(-1, -1))
             }
@@ -2624,6 +3284,26 @@ class LocalApi(private val ctx: Context) {
             }
         }
 
+        // 智谱清言 / 百度千帆（V2.76）：单账号，各一个任务。
+        // 两家都没有独立的「只读余额」端点，直接复用 probe（智谱会顺带 refresh 一次，
+        // 百度只打 loginBonusInfo 只读接口），拿不到就 -1，界面显示「—」。
+        val zpReadyT = isReady("zhipu", s)
+        val qfReadyT = isReady("qianfan", s)
+        if (zpReadyT) {
+            tasks.add {
+                runCatching {
+                    runBlocking { ZhipuCheckin.probe(s.zpCookie, s.zpDeviceId) }
+                }.getOrNull()?.optInt("total", -1) ?: -1
+            }
+        }
+        if (qfReadyT) {
+            tasks.add {
+                runCatching {
+                    runBlocking { DumateCheckin.probe(s.qfCookie) }
+                }.getOrNull()?.optInt("total", -1) ?: -1
+            }
+        }
+
         val out = parallel(tasks)
         // WorkBuddy 先占 wbAccs.size 个槽位（每个账号自己的余额），再一个是签到状态文档
         val wbVals = wbAccs.indices.map { (out.getOrNull(it) as? Int) ?: -1 }
@@ -2638,6 +3318,8 @@ class LocalApi(private val ctx: Context) {
         val qoderPairs = qoderAccs.map { nextPair() }
         val mmPairs = mmAccs.map { nextPair() }
         val hwVals = hwAccs.map { nextInt() }
+        val zpVal = if (zpReadyT) nextInt() else -1
+        val qfVal = if (qfReadyT) nextInt() else -1
 
         // WorkBuddy：逐账号落库。
         //
@@ -2702,6 +3384,21 @@ class LocalApi(private val ctx: Context) {
 
         var qdSum = 0; var qdUsedSum = 0; var qdAny = false
         qoderAccs.forEachIndexed { i, acc ->
+            // BUGS-v2.63-287 P3-2：余额路径续期换出的新凭据在调用线程回写
+            qdRenewed[acc.id]?.let { (t, rf) ->
+                runCatching {
+                    if (acc.id == HistoryStore.DEFAULT_ACCOUNT) {
+                        runBlocking {
+                            val cur = SettingsStore.flow(ctx).first()
+                            SettingsStore.save(ctx, cur.copy(
+                                qoderToken = t.ifBlank { cur.qoderToken },
+                                qoderRefresh = rf.ifBlank { cur.qoderRefresh }))
+                        }
+                    } else {
+                        QoderAccountStore.update(ctx, acc.copy(token = t, refresh = rf))
+                    }
+                }
+            }
             val (total, used) = qoderPairs.getOrElse(i) { Pair(-1, -1) }
             if (total >= 0) {
                 store.updateTotals(day, "qoder", total = total,
@@ -2765,6 +3462,18 @@ class LocalApi(private val ctx: Context) {
         if (hwAny) {
             cacheTotal("huawei", hwSum)
             totals.put("huawei", hwSum)
+        }
+
+        // 智谱清言 / 百度千帆（V2.76）：单账号，读数只写主账号那一行。
+        if (zpVal >= 0) {
+            store.updateTotals(day, "zhipu", total = zpVal, accountKey = HistoryStore.DEFAULT_ACCOUNT, used = -1)
+            cacheTotal("zhipu", zpVal)
+            totals.put("zhipu", zpVal)
+        }
+        if (qfVal >= 0) {
+            store.updateTotals(day, "qianfan", total = qfVal, accountKey = HistoryStore.DEFAULT_ACCOUNT, used = -1)
+            cacheTotal("qianfan", qfVal)
+            totals.put("qianfan", qfVal)
         }
         // WorkBuddy 的累计已用：资产卡正面用 wb_assets 的 remaining，
         // 翻面用同一次查询里的 used_total，落库后首页/翻面都能读到。

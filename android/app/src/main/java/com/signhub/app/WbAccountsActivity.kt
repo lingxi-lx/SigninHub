@@ -288,6 +288,14 @@ class WbAccountsActivity : Activity() {
                 checkOne(acc)
             }
             btns.addView(signBtn)
+            val renameBtn = pill(text = "改名",
+                colors = listOf(Color.TRANSPARENT, Color.TRANSPARENT),
+                textColor = Color.parseColor("#C7D2FF"),
+                widthDp = 74, endMarginDp = 10,
+                stroke = Color.parseColor("#6C8CFF55")) {
+                rename(acc)
+            }
+            btns.addView(renameBtn)
             val delBtn = pill(text = "删除",
                 colors = listOf(Color.TRANSPARENT, Color.TRANSPARENT),
                 textColor = Color.parseColor("#FFB3BF"),
@@ -502,6 +510,31 @@ class WbAccountsActivity : Activity() {
                 refreshList()
             }
         }.start()
+    }
+
+    /**
+     * 改显示名（用户 m02619）。
+     *
+     * 只写 `alias`，不动 `nickname`（那是 OAuth `login/account` 回来的上游昵称，
+     * 每次登录/刷新都会覆盖）。留空保存 = 恢复自动名。
+     * 走 `WbAccountStore.update()`（按 id 整条替换），只改 alias 不碰凭据。
+     */
+    private fun rename(acc: WbAccount) {
+        val auto = acc.copy(alias = "").displayName() +
+            (if (acc.variant == "ai") "（国际版）" else "")
+        SignDialog.input(
+            this,
+            kicker = "RENAME",
+            title = "自定义名称",
+            subtitle = "起一个自己好认的名字，比如「主号」「国际号」。\n留空保存则恢复自动名称（当前显示：$auto）。",
+            fields = listOf(SignDialog.Field("名称", initial = acc.alias)),
+            okText = "保存",
+        ) { v ->
+            val alias = v[0].trim().take(24)
+            WbAccountStore.update(this, acc.copy(alias = alias))
+            refreshList()
+            toast(if (alias.isBlank()) "已恢复自动名称" else "已改名为「$alias」")
+        }
     }
 
     private fun confirmDelete(acc: WbAccount) {
